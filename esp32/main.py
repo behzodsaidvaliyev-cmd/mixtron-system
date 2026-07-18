@@ -9,6 +9,7 @@ import machine
 import network
 import time
 import ssl
+import gc
 from machine import UART, Pin, WDT
 
 try:
@@ -48,7 +49,7 @@ PZEM_DEBUG = True            # prints raw bytes on read failure - set False once
 WDT_TIMEOUT_MS = 60000       # if main loop hangs this long (power-glitch freeze), force reboot
 
 # --- OTA (masofadan yangilash, GitHub'dan) ---
-OTA_ENABLED = True
+OTA_ENABLED = False  # vaqtincha o'chirilgan - xotira yetishmasligi MQTT ulanishiga xalaqit berdi
 OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32/main.py"
 OTA_CHECK_INTERVAL_S = 3600  # har soatda tekshiradi
 
@@ -227,6 +228,7 @@ def check_for_update():
         print("[OTA] urequests topilmadi - o'rnating: mip.install('urequests')")
         return False
 
+    gc.collect()
     try:
         r = urequests.get(OTA_URL)
         new_code = r.text
@@ -234,6 +236,8 @@ def check_for_update():
     except Exception as e:
         print("[OTA] yuklab olishda xato:", e)
         return False
+    finally:
+        gc.collect()
 
     if not new_code or "def main()" not in new_code:
         print("[OTA] noto'g'ri fayl keldi, bekor qilindi")
@@ -262,6 +266,7 @@ def check_for_update():
 # ---------------------------------------------------------------------------
 
 def mqtt_connect():
+    gc.collect()  # SSL handshake uchun maksimal bo'sh xotira kerak
     client = MQTTClient(
         client_id=MQTT_CLIENT_ID,
         server=MQTT_BROKER,
@@ -435,6 +440,8 @@ def main():
                     check_for_update()
                 except Exception as e:
                     print("[OTA] tekshirishda xato:", e)
+
+            gc.collect()
 
         time.sleep(0.05)
 
