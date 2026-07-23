@@ -38,6 +38,7 @@ MQTT_PORT = 8883
 MQTT_CLIENT_ID = "esp32-mixtron2-" + "".join("{:02x}".format(b) for b in machine.unique_id())
 MQTT_TOPIC = b"mixtron2/data"
 MQTT_EVENTS_TOPIC = b"mixtron2/events"
+MQTT_COMMAND_TOPIC = b"mixtron2/command"
 MQTT_KEEPALIVE = 60
 
 AMP_THRESHOLD = 1.5          # Amps - above this, machine counted as "running"
@@ -277,6 +278,17 @@ def check_for_update():
 # MQTT (SSL) - HiveMQ Cloud
 # ---------------------------------------------------------------------------
 
+def mqtt_message_callback(topic, msg):
+    if topic == MQTT_COMMAND_TOPIC:
+        cmd = msg.decode("utf-8", "ignore").strip()
+        print("[MQTT] buyruq keldi:", cmd)
+        if cmd == "CHECK_UPDATE":
+            try:
+                check_for_update()
+            except Exception as e:
+                print("[OTA] masofadan buyruq bilan tekshirishda xato:", e)
+
+
 def mqtt_connect():
     gc.collect()  # SSL handshake uchun maksimal bo'sh xotira kerak
     client = MQTTClient(
@@ -292,7 +304,9 @@ def mqtt_connect():
             "cert_reqs": ssl.CERT_NONE,
         },
     )
+    client.set_callback(mqtt_message_callback)
     client.connect()
+    client.subscribe(MQTT_COMMAND_TOPIC)
     print("[MQTT] connected to", MQTT_BROKER)
     return client
 
@@ -467,6 +481,13 @@ def main():
     while True:
         feed_wdt()
         check_serial_commands()
+
+        if client is not None:
+            try:
+                client.check_msg()  # kelgan MQTT buyruqlarni tekshiradi (masalan CHECK_UPDATE)
+            except Exception as e:
+                print("[MQTT] xabar tekshirishda xato:", e)
+                client = None
 
         now = time.time()
         if now - last_poll >= POLL_INTERVAL_S:
