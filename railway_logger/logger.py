@@ -8,6 +8,7 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
 MQTT_USER = os.environ["MQTT_USER"]
 MQTT_PASSWORD = os.environ["MQTT_PASSWORD"]
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "mixtron2/data")
+MQTT_EVENTS_TOPIC = os.environ.get("MQTT_EVENTS_TOPIC", "mixtron2/events")
 
 DB_PATH = os.environ.get("DB_PATH", "/data/mixtron.db")
 
@@ -29,6 +30,16 @@ def ensure_db():
             pf REAL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cycle_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TEXT DEFAULT (datetime('now')),
+            event_ts INTEGER,
+            event_time TEXT,
+            event_type TEXT,
+            motosoat REAL
+        )
+    """)
     conn.commit()
     return conn
 
@@ -36,24 +47,39 @@ def ensure_db():
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[MQTT] connected, rc =", rc)
     client.subscribe(MQTT_TOPIC)
+    client.subscribe(MQTT_EVENTS_TOPIC)
 
 
 def on_message(client, userdata, msg):
     conn = userdata["conn"]
     line = msg.payload.decode("utf-8", "ignore")
-    if not line.startswith("DATA|"):
-        return
-    try:
-        parts = line.split("|")
-        status, volt, amp, watt, motosoat, energy, freq, pf = parts[1:9]
-        conn.execute(
-            "INSERT INTO readings (status, volt, amp, watt, motosoat, energy, freq, pf) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (status, float(volt), float(amp), float(watt), float(motosoat), float(energy), float(freq), float(pf)),
-        )
-        conn.commit()
-        print("[DB] saved:", line)
-    except Exception as e:
-        print("[DB] parse/save error:", e, "line:", line)
+
+    if line.startswith("DATA|"):
+        try:
+            parts = line.split("|")
+            status, volt, amp, watt, motosoat, energy, freq, pf = parts[1:9]
+            conn.execute(
+                "INSERT INTO readings (status, volt, amp, watt, motosoat, energy, freq, pf) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (status, float(volt), float(amp), float(watt), float(motosoat), float(energy), float(freq), float(pf)),
+            )
+            conn.commit()
+            print("[DB] saved:", line)
+        except Exception as e:
+            print("[DB] parse/save error:", e, "line:", line)
+
+    elif line.startswith("EVENT|"):
+        try:
+            parts = line.split("|")
+            event_ts, event_type, motosoat = parts[1], parts[2], parts[3]
+            event_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(event_ts)))
+            conn.execute(
+                "INSERT INTO cycle_events (event_ts, event_time, event_type, motosoat) VALUES (?, ?, ?, ?)",
+                (int(event_ts), event_time, event_type, float(motosoat)),
+            )
+            conn.commit()
+            print("[EVENT] saved:", event_type, "at", event_time, "motosoat =", motosoat)
+        except Exception as e:
+            print("[EVENT] parse/save error:", e, "line:", line)
 
 
 def main():

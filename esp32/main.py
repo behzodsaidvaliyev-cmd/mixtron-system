@@ -24,6 +24,7 @@ except ImportError:
 WIFI_CONFIG_FILE = "wifi_config.json"
 MQTT_CONFIG_FILE = "mqtt_config.json"  # faqat qurilmada turadi, GitHub'ga hech qachon yuklanmaydi
 MOTOHOURS_FILE = "motohours.txt"
+EVENTS_QUEUE_FILE = "events_queue.txt"  # internet yo'q paytda ON/OFF voqealari shu yerda kutadi
 
 
 def load_mqtt_config():
@@ -36,6 +37,7 @@ MQTT_BROKER, MQTT_USER, MQTT_PASSWORD = load_mqtt_config()
 MQTT_PORT = 8883
 MQTT_CLIENT_ID = "esp32-mixtron2-" + "".join("{:02x}".format(b) for b in machine.unique_id())
 MQTT_TOPIC = b"mixtron2/data"
+MQTT_EVENTS_TOPIC = b"mixtron2/events"
 MQTT_KEEPALIVE = 60
 
 AMP_THRESHOLD = 1.5          # Amps - above this, machine counted as "running"
@@ -78,6 +80,16 @@ def connect_wifi(timeout_s=10):
             time.sleep(0.5)
     print("[WIFI] connected, ip =", wlan.ifconfig()[0])
     return wlan
+
+
+def sync_time():
+    """Haqiqiy sana-vaqtni internetdan olib qo'yadi (voqealarga aniq vaqt yozish uchun)."""
+    try:
+        import ntptime
+        ntptime.settime()
+        print("[TIME] NTP orqali sozlandi (UTC):", time.localtime())
+    except Exception as e:
+        print("[TIME] NTP sozlashda xato:", e)
 
 
 def _decode_ssid(raw):
@@ -285,6 +297,73 @@ def mqtt_connect():
     return client
 
 
+UNIX_EPOCH_OFFSET = 946684800  # MicroPython vaqti 2000-yildan, Unix vaqti 1970-yildan boshlanadi
+
+
+def queue_event(event_type, motosoat):
+    """Drobilka ON/OFF holatini o'zgarganda mahalliy faylga yozib qo'yadi (internet bo'lmasa ham)."""
+    unix_ts = time.time() + UNIX_EPOCH_OFFSET
+    line = "EVENT|{ts}|{event}|{motosoat:.4f}".format(
+        ts=unix_ts, event=event_type, motosoat=motosoat
+    )
+    with open(EVENTS_QUEUE_FILE, "a") as f:
+        f.write(line + "\n")
+    print("[EVENT] queued:", line)
+
+
+def flush_event_queue(client):
+    """Navbatdagi voqealarni Railway'ga (MQTT orqali) yuborishga harakat qiladi."""
+    try:
+        with open(EVENTS_QUEUE_FILE) as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+    except OSError:
+        return client
+
+    if not lines:
+        return client
+
+    if client is None:
+        try:
+            client = mqtt_connect()
+        except Exception as e:
+            print("[EVENT] flush uchun ulanib bo'lmadi:", e)
+            return client
+
+    sent_count = 0
+    for line in lines:
+        try:
+            client.publish(MQTT_EVENTS_TOPIC, line)
+            sent_count += 1
+        except Exception as e:
+            print("[EVENT] yuborishda xato, qolganlari keyinroq:", e)
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            try:
+                client = mqtt_connect()
+            except Exception as e2:
+                print("[EVENT] qayta ulanib bo'lmadi:", e2)
+            break
+
+    remaining = lines[sent_count:]
+    import os
+    if remaining:
+        tmp_file = EVENTS_QUEUE_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
+            for l in remaining:
+                f.write(l + "\n")
+        os.rename(tmp_file, EVENTS_QUEUE_FILE)
+    else:
+        try:
+            os.remove(EVENTS_QUEUE_FILE)
+        except OSError:
+            pass
+
+    print("[EVENT] {} ta voqea yuborildi, {} ta navbatda qoldi".format(sent_count, len(remaining)))
+    return client
+
+
 def mqtt_publish_with_retry(client, payload, max_retries=3):
     for attempt in range(max_retries):
         feed_wdt()
@@ -350,6 +429,7 @@ def main():
 
     try:
         connect_wifi()
+        sync_time()
     except Exception as e:
         print("[WIFI] connect failed:", e)
         try:
@@ -367,6 +447,7 @@ def main():
     last_publish = 0
     last_save = time.time()
     last_ota_check = time.time()
+    last_status = None
 
     try:
         check_for_update()  # har boshlanishda ham bir marta tekshiradi
@@ -395,6 +476,11 @@ def main():
                 if status == "ON":
                     motohours += dt_hours
 
+                if status != last_status:
+                    queue_event(status, motohours)
+                    last_status = status
+                    client = flush_event_queue(client)
+
                 data_line = "DATA|{status}|{volt:.1f}|{amp:.3f}|{watt:.1f}|{motosoat:.4f}|{energy}|{freq:.1f}|{pf:.2f}".format(
                     status=status,
                     volt=reading["voltage"],
@@ -417,6 +503,11 @@ def main():
                     if client is not None:
                         client = mqtt_publish_with_retry(client, data_line)
             else:
+                if last_status != "OFF":
+                    queue_event("OFF", motohours)
+                    last_status = "OFF"
+                    client = flush_event_queue(client)
+
                 data_line = "DATA|OFF|0.0|0.000|0.0|{motosoat:.4f}|0|0.0|0.00".format(motosoat=motohours)
                 print(data_line + "  (PZEM javob bermayapti - quvvat yo'q bo'lishi mumkin)")
 
@@ -433,6 +524,7 @@ def main():
             if now - last_save >= MOTOHOURS_SAVE_INTERVAL_S:
                 last_save = now
                 save_motohours(motohours)
+                client = flush_event_queue(client)  # navbatda qolgan voqealar bo'lsa, qayta urinadi
 
             if now - last_ota_check >= OTA_CHECK_INTERVAL_S:
                 last_ota_check = now
