@@ -51,7 +51,7 @@ PZEM_DEBUG = True            # prints raw bytes on read failure - set False once
 WDT_TIMEOUT_MS = 60000       # if main loop hangs this long (power-glitch freeze), force reboot
 
 # --- OTA (masofadan yangilash, GitHub'dan) ---
-OTA_ENABLED = False  # vaqtincha o'chirilgan - xotira yetishmasligi MQTT ulanishiga xalaqit berdi
+OTA_ENABLED = True
 OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32/main.py"
 OTA_CHECK_INTERVAL_S = 86400  # kuniga bir marta tekshiradi (kod kamdan-kam o'zgargani uchun yetarli)
 
