@@ -53,7 +53,7 @@ WDT_TIMEOUT_MS = 60000       # if main loop hangs this long (power-glitch freeze
 # --- OTA (masofadan yangilash, GitHub'dan) ---
 OTA_ENABLED = False  # vaqtincha o'chirilgan - xotira yetishmasligi MQTT ulanishiga xalaqit berdi
 OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32/main.py"
-OTA_CHECK_INTERVAL_S = 3600  # har soatda tekshiradi
+OTA_CHECK_INTERVAL_S = 86400  # kuniga bir marta tekshiradi (kod kamdan-kam o'zgargani uchun yetarli)
 
 # ---------------------------------------------------------------------------
 # WIFI
@@ -418,6 +418,15 @@ def check_serial_commands():
         except Exception as e:
             print("WIFI_SET_ERROR|" + str(e))
 
+    elif line == "CHECK_UPDATE":
+        print("[OTA] qo'lda tekshirish boshlandi...")
+        try:
+            updated = check_for_update()
+            if not updated:
+                print("[OTA] yangilanish topilmadi yoki kerak emas")
+        except Exception as e:
+            print("[OTA] qo'lda tekshirishda xato:", e)
+
 
 # ---------------------------------------------------------------------------
 # MAIN LOOP
@@ -446,13 +455,8 @@ def main():
     last_poll = time.time()
     last_publish = 0
     last_save = time.time()
-    last_ota_check = time.time()
+    last_ota_check = time.time()  # birinchi OTA tekshiruvi MQTT barqarorlashgandan keyin, navbatdagi intervalda bo'ladi
     last_status = None
-
-    try:
-        check_for_update()  # har boshlanishda ham bir marta tekshiradi
-    except Exception as e:
-        print("[OTA] boot-time check xato:", e)
 
     client = None
     try:
