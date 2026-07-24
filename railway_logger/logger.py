@@ -2,8 +2,10 @@ import os
 import sqlite3
 import time
 import json
+import calendar
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 import paho.mqtt.client as mqtt
 
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "5a03687ae2394725ba4e934337264c51.s1.eu.hivemq.cloud")
@@ -47,6 +49,10 @@ def get_conn():
             motosoat REAL
         )
     """)
+    try:
+        conn.execute("ALTER TABLE readings ADD COLUMN received_ts INTEGER")
+    except sqlite3.OperationalError:
+        pass  # ustun allaqachon bor
     conn.commit()
     return conn
 
@@ -67,8 +73,8 @@ def on_message(client, userdata, msg):
             status, volt, amp, watt, motosoat, energy, freq, pf = parts[1:9]
             with db_lock:
                 conn.execute(
-                    "INSERT INTO readings (status, volt, amp, watt, motosoat, energy, freq, pf) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (status, float(volt), float(amp), float(watt), float(motosoat), float(energy), float(freq), float(pf)),
+                    "INSERT INTO readings (status, volt, amp, watt, motosoat, energy, freq, pf, received_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (status, float(volt), float(amp), float(watt), float(motosoat), float(energy), float(freq), float(pf), int(time.time())),
                 )
                 conn.commit()
             print("[DB] saved:", line)
@@ -91,37 +97,83 @@ def on_message(client, userdata, msg):
             print("[EVENT] parse/save error:", e, "line:", line)
 
 
-def compute_hours_today(conn):
-    now_utc = time.time()
-    local_seconds_of_day = (now_utc + UZ_OFFSET) % 86400
-    midnight_utc = now_utc - local_seconds_of_day
+def local_midnight_utc_ts(date_str):
+    """'YYYY-MM-DD' (mahalliy sana) ni o'sha kunning mahalliy 00:00'i uchun Unix (UTC) vaqtiga aylantiradi."""
+    dt = time.strptime(date_str, "%Y-%m-%d")
+    return calendar.timegm(dt) - UZ_OFFSET
 
+
+def motosoat_at(conn, target_utc_ts):
+    """Berilgan vaqtga eng yaqin (undan oldingi) motosoat qiymatini topadi."""
     with db_lock:
         row = conn.execute(
-            "SELECT motosoat FROM cycle_events WHERE event_ts < ? ORDER BY event_ts DESC LIMIT 1",
-            (midnight_utc,),
+            "SELECT motosoat FROM readings WHERE received_ts <= ? ORDER BY received_ts DESC LIMIT 1",
+            (target_utc_ts,),
         ).fetchone()
-        baseline = row[0] if row else 0.0
+        if row:
+            return row[0]
 
-        row2 = conn.execute("SELECT motosoat FROM readings ORDER BY id DESC LIMIT 1").fetchone()
-        current = row2[0] if row2 else baseline
+        row2 = conn.execute(
+            "SELECT motosoat FROM readings WHERE received_ts >= ? ORDER BY received_ts ASC LIMIT 1",
+            (target_utc_ts,),
+        ).fetchone()
+        return row2[0] if row2 else 0.0
 
-    return max(0.0, current - baseline)
+
+def compute_hours_range(conn, from_ts, to_ts):
+    start_motosoat = motosoat_at(conn, from_ts)
+    end_motosoat = motosoat_at(conn, to_ts)
+    return max(0.0, end_motosoat - start_motosoat)
+
+
+def compute_hours_today(conn):
+    now_utc = time.time()
+    today_local = time.strftime("%Y-%m-%d", time.gmtime(now_utc + UZ_OFFSET))
+    return compute_hours_range(conn, local_midnight_utc_ts(today_local), now_utc)
+
+
+def parse_time_param(value, default):
+    """Qiymat sana ('YYYY-MM-DD', mahalliy) yoki Unix vaqt bo'lishi mumkin."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return local_midnight_utc_ts(value)
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/today_hours":
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+
+        if parsed.path == "/today_hours":
             hours = compute_hours_today(self.server.db_conn)
             body = json.dumps({"hours_today": round(hours, 3)}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+
+        elif parsed.path == "/hours":
+            try:
+                now_utc = time.time()
+                from_ts = parse_time_param(params.get("from", [None])[0], now_utc - 86400)
+                to_ts = parse_time_param(params.get("to", [None])[0], now_utc)
+                hours = compute_hours_range(self.server.db_conn, from_ts, to_ts)
+                body = json.dumps({"from": from_ts, "to": to_ts, "hours": round(hours, 3)}).encode()
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(str(e).encode())
+                return
+
         else:
             self.send_response(404)
             self.end_headers()
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
         pass  # standart konsolni shovqindan tozalash
