@@ -54,6 +54,19 @@ def get_conn():
     except sqlite3.OperationalError:
         pass  # ustun allaqachon bor
     conn.commit()
+
+    # eski yozuvlarda received_ts bo'sh qolgan - received_at matnidan orqaga qarab to'ldiramiz
+    rows = conn.execute("SELECT id, received_at FROM readings WHERE received_ts IS NULL").fetchall()
+    for row_id, received_at in rows:
+        try:
+            ts = calendar.timegm(time.strptime(received_at, "%Y-%m-%d %H:%M:%S"))
+            conn.execute("UPDATE readings SET received_ts = ? WHERE id = ?", (ts, row_id))
+        except Exception:
+            pass
+    if rows:
+        conn.commit()
+        print("[DB] {} ta eski yozuvga vaqt to'ldirildi".format(len(rows)))
+
     return conn
 
 
