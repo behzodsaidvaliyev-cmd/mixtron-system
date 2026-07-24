@@ -12,12 +12,16 @@ MQTT_BROKER = os.environ.get("MQTT_BROKER", "5a03687ae2394725ba4e934337264c51.s1
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
 MQTT_USER = os.environ["MQTT_USER"]
 MQTT_PASSWORD = os.environ["MQTT_PASSWORD"]
-MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "mixtron2/data")
-MQTT_EVENTS_TOPIC = os.environ.get("MQTT_EVENTS_TOPIC", "mixtron2/events")
+
+# Har qanday zavod/qurilma "<nom>/data" va "<nom>/events" topic'lariga yozsa, avtomatik qabul qilinadi
+# (masalan mixtron2/data, zavod1/data - kodga tegmasdan yangi qurilma qo'shsa bo'ladi)
+DATA_TOPIC_FILTER = "+/data"
+EVENTS_TOPIC_FILTER = "+/events"
 
 DB_PATH = os.environ.get("DB_PATH", "/data/mixtron.db")
 HTTP_PORT = int(os.environ.get("PORT", "8080"))
 UZ_OFFSET = 5 * 3600  # O'zbekiston UTC+5
+DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "mixtron2")  # ?zavod= berilmasa, shu ishlatiladi
 
 db_lock = threading.Lock()
 
@@ -29,6 +33,7 @@ def get_conn():
         CREATE TABLE IF NOT EXISTS readings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             received_at TEXT DEFAULT (datetime('now')),
+            device TEXT,
             status TEXT,
             volt REAL,
             amp REAL,
@@ -43,16 +48,27 @@ def get_conn():
         CREATE TABLE IF NOT EXISTS cycle_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             received_at TEXT DEFAULT (datetime('now')),
+            device TEXT,
             event_ts INTEGER,
             event_time_local TEXT,
             event_type TEXT,
             motosoat REAL
         )
     """)
-    try:
-        conn.execute("ALTER TABLE readings ADD COLUMN received_ts INTEGER")
-    except sqlite3.OperationalError:
-        pass  # ustun allaqachon bor
+    for stmt in (
+        "ALTER TABLE readings ADD COLUMN received_ts INTEGER",
+        "ALTER TABLE readings ADD COLUMN device TEXT",
+        "ALTER TABLE cycle_events ADD COLUMN device TEXT",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # ustun allaqachon bor
+    conn.commit()
+
+    # eski yozuvlarda device bo'sh - bular birinchi ESP32'dan (mixtron2) kelgani ma'lum
+    conn.execute("UPDATE readings SET device = 'mixtron2' WHERE device IS NULL")
+    conn.execute("UPDATE cycle_events SET device = 'mixtron2' WHERE device IS NULL")
     conn.commit()
 
     # eski yozuvlarda received_ts bo'sh qolgan - received_at matnidan orqaga qarab to'ldiramiz
@@ -72,12 +88,13 @@ def get_conn():
 
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[MQTT] connected, rc =", rc)
-    client.subscribe(MQTT_TOPIC)
-    client.subscribe(MQTT_EVENTS_TOPIC)
+    client.subscribe(DATA_TOPIC_FILTER)
+    client.subscribe(EVENTS_TOPIC_FILTER)
 
 
 def on_message(client, userdata, msg):
     conn = userdata["conn"]
+    device = msg.topic.split("/")[0]
     line = msg.payload.decode("utf-8", "ignore")
 
     if line.startswith("DATA|"):
@@ -86,11 +103,11 @@ def on_message(client, userdata, msg):
             status, volt, amp, watt, motosoat, energy, freq, pf = parts[1:9]
             with db_lock:
                 conn.execute(
-                    "INSERT INTO readings (status, volt, amp, watt, motosoat, energy, freq, pf, received_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (status, float(volt), float(amp), float(watt), float(motosoat), float(energy), float(freq), float(pf), int(time.time())),
+                    "INSERT INTO readings (device, status, volt, amp, watt, motosoat, energy, freq, pf, received_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (device, status, float(volt), float(amp), float(watt), float(motosoat), float(energy), float(freq), float(pf), int(time.time())),
                 )
                 conn.commit()
-            print("[DB] saved:", line)
+            print("[DB] saved ({}): {}".format(device, line))
         except Exception as e:
             print("[DB] parse/save error:", e, "line:", line)
 
@@ -101,11 +118,11 @@ def on_message(client, userdata, msg):
             event_time_local = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(event_ts) + UZ_OFFSET))
             with db_lock:
                 conn.execute(
-                    "INSERT INTO cycle_events (event_ts, event_time_local, event_type, motosoat) VALUES (?, ?, ?, ?)",
-                    (int(event_ts), event_time_local, event_type, float(motosoat)),
+                    "INSERT INTO cycle_events (device, event_ts, event_time_local, event_type, motosoat) VALUES (?, ?, ?, ?, ?)",
+                    (device, int(event_ts), event_time_local, event_type, float(motosoat)),
                 )
                 conn.commit()
-            print("[EVENT] saved:", event_type, "at", event_time_local, "(mahalliy vaqt) motosoat =", motosoat)
+            print("[EVENT] saved ({}): {} at {} (mahalliy vaqt) motosoat = {}".format(device, event_type, event_time_local, motosoat))
         except Exception as e:
             print("[EVENT] parse/save error:", e, "line:", line)
 
@@ -128,33 +145,33 @@ def local_str_to_utc_ts(value):
     raise ValueError("noto'g'ri sana/vaqt format: " + value)
 
 
-def motosoat_at(conn, target_utc_ts):
-    """Berilgan vaqtga eng yaqin (undan oldingi) motosoat qiymatini topadi."""
+def motosoat_at(conn, device, target_utc_ts):
+    """Berilgan zavod uchun, berilgan vaqtga eng yaqin (undan oldingi) motosoat qiymatini topadi."""
     with db_lock:
         row = conn.execute(
-            "SELECT motosoat FROM readings WHERE received_ts <= ? ORDER BY received_ts DESC LIMIT 1",
-            (target_utc_ts,),
+            "SELECT motosoat FROM readings WHERE device = ? AND received_ts <= ? ORDER BY received_ts DESC LIMIT 1",
+            (device, target_utc_ts),
         ).fetchone()
         if row:
             return row[0]
 
         row2 = conn.execute(
-            "SELECT motosoat FROM readings WHERE received_ts >= ? ORDER BY received_ts ASC LIMIT 1",
-            (target_utc_ts,),
+            "SELECT motosoat FROM readings WHERE device = ? AND received_ts >= ? ORDER BY received_ts ASC LIMIT 1",
+            (device, target_utc_ts),
         ).fetchone()
         return row2[0] if row2 else 0.0
 
 
-def compute_hours_range(conn, from_ts, to_ts):
-    start_motosoat = motosoat_at(conn, from_ts)
-    end_motosoat = motosoat_at(conn, to_ts)
+def compute_hours_range(conn, device, from_ts, to_ts):
+    start_motosoat = motosoat_at(conn, device, from_ts)
+    end_motosoat = motosoat_at(conn, device, to_ts)
     return max(0.0, end_motosoat - start_motosoat)
 
 
-def compute_hours_today(conn):
+def compute_hours_today(conn, device):
     now_utc = time.time()
     today_local = time.strftime("%Y-%m-%d", time.gmtime(now_utc + UZ_OFFSET))
-    return compute_hours_range(conn, local_midnight_utc_ts(today_local), now_utc)
+    return compute_hours_range(conn, device, local_midnight_utc_ts(today_local), now_utc)
 
 
 def parse_time_param(value, default):
@@ -172,17 +189,19 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
 
+        device = params.get("zavod", [DEFAULT_DEVICE])[0]
+
         if parsed.path == "/today_hours":
-            hours = compute_hours_today(self.server.db_conn)
-            body = json.dumps({"hours_today": round(hours, 3)}).encode()
+            hours = compute_hours_today(self.server.db_conn, device)
+            body = json.dumps({"zavod": device, "hours_today": round(hours, 3)}).encode()
 
         elif parsed.path == "/hours":
             try:
                 now_utc = time.time()
                 from_ts = parse_time_param(params.get("from", [None])[0], now_utc - 86400)
                 to_ts = parse_time_param(params.get("to", [None])[0], now_utc)
-                hours = compute_hours_range(self.server.db_conn, from_ts, to_ts)
-                body = json.dumps({"from": from_ts, "to": to_ts, "hours": round(hours, 3)}).encode()
+                hours = compute_hours_range(self.server.db_conn, device, from_ts, to_ts)
+                body = json.dumps({"zavod": device, "from": from_ts, "to": to_ts, "hours": round(hours, 3)}).encode()
             except Exception as e:
                 self.send_response(400)
                 self.end_headers()
