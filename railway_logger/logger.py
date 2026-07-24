@@ -116,6 +116,18 @@ def local_midnight_utc_ts(date_str):
     return calendar.timegm(dt) - UZ_OFFSET
 
 
+def local_str_to_utc_ts(value):
+    """Mahalliy sana yoki sana+vaqt satrini Unix (UTC) vaqtiga aylantiradi.
+    Qabul qilinadigan formatlar: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', 'YYYY-MM-DD HH:MM:SS'."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = time.strptime(value, fmt)
+            return calendar.timegm(dt) - UZ_OFFSET
+        except ValueError:
+            continue
+    raise ValueError("noto'g'ri sana/vaqt format: " + value)
+
+
 def motosoat_at(conn, target_utc_ts):
     """Berilgan vaqtga eng yaqin (undan oldingi) motosoat qiymatini topadi."""
     with db_lock:
@@ -146,13 +158,13 @@ def compute_hours_today(conn):
 
 
 def parse_time_param(value, default):
-    """Qiymat sana ('YYYY-MM-DD', mahalliy) yoki Unix vaqt bo'lishi mumkin."""
+    """Qiymat Unix vaqt yoki mahalliy sana/vaqt satri ('YYYY-MM-DD HH:MM') bo'lishi mumkin."""
     if value is None:
         return default
     try:
         return float(value)
     except ValueError:
-        return local_midnight_utc_ts(value)
+        return local_str_to_utc_ts(value.replace("T", " "))
 
 
 class Handler(BaseHTTPRequestHandler):
