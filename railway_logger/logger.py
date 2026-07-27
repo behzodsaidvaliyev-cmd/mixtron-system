@@ -59,6 +59,7 @@ def get_conn():
         "ALTER TABLE readings ADD COLUMN received_ts INTEGER",
         "ALTER TABLE readings ADD COLUMN device TEXT",
         "ALTER TABLE cycle_events ADD COLUMN device TEXT",
+        "ALTER TABLE cycle_events ADD COLUMN event_time_local TEXT",
     ):
         try:
             conn.execute(stmt)
@@ -82,6 +83,18 @@ def get_conn():
     if rows:
         conn.commit()
         print("[DB] {} ta eski yozuvga vaqt to'ldirildi".format(len(rows)))
+
+    # eski voqealarda event_time_local bo'sh qolgan - event_ts'dan qayta hisoblab to'ldiramiz
+    event_rows = conn.execute("SELECT id, event_ts FROM cycle_events WHERE event_time_local IS NULL").fetchall()
+    for row_id, event_ts in event_rows:
+        try:
+            t = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(event_ts + UZ_OFFSET))
+            conn.execute("UPDATE cycle_events SET event_time_local = ? WHERE id = ?", (t, row_id))
+        except Exception:
+            pass
+    if event_rows:
+        conn.commit()
+        print("[DB] {} ta eski voqeaga mahalliy vaqt to'ldirildi".format(len(event_rows)))
 
     return conn
 
