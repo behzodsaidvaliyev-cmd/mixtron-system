@@ -1,5 +1,5 @@
 """
-MIXTRON 2 - Drobilka Zavodi runtime & energy monitor
+ZAVOD 3 - Drobilka runtime & energy monitor
 ESP32 / MicroPython v1.28.0
 PZEM-004T (UART2, TX=17, RX=16) -> moto-hours calc -> HiveMQ Cloud (MQTT/SSL)
 """
@@ -25,6 +25,7 @@ WIFI_CONFIG_FILE = "wifi_config.json"
 MQTT_CONFIG_FILE = "mqtt_config.json"  # faqat qurilmada turadi, GitHub'ga hech qachon yuklanmaydi
 MOTOHOURS_FILE = "motohours.txt"
 EVENTS_QUEUE_FILE = "events_queue.txt"  # internet yo'q paytda ON/OFF voqealari shu yerda kutadi
+THRESHOLD_FILE = "threshold.txt"  # har ESP32 o'zining amper chegarasini shu yerda saqlaydi
 
 
 def load_mqtt_config():
@@ -35,13 +36,13 @@ def load_mqtt_config():
 
 MQTT_BROKER, MQTT_USER, MQTT_PASSWORD = load_mqtt_config()
 MQTT_PORT = 8883
-MQTT_CLIENT_ID = "esp32-mixtron2-" + "".join("{:02x}".format(b) for b in machine.unique_id())
-MQTT_TOPIC = b"mixtron2/data"
-MQTT_EVENTS_TOPIC = b"mixtron2/events"
-MQTT_COMMAND_TOPIC = b"mixtron2/command"
+MQTT_CLIENT_ID = "esp32-zavod3-" + "".join("{:02x}".format(b) for b in machine.unique_id())
+MQTT_TOPIC = b"zavod3/data"
+MQTT_EVENTS_TOPIC = b"zavod3/events"
+MQTT_COMMAND_TOPIC = b"zavod3/command"
 MQTT_KEEPALIVE = 60
 
-AMP_THRESHOLD = 1.5          # Amps - above this, machine counted as "running"
+DEFAULT_AMP_THRESHOLD = 1.5  # Amps - fayl bo'lmasa shu qiymat ishlatiladi
 POLL_INTERVAL_S = 2          # seconds between PZEM reads
 PUBLISH_INTERVAL_S = 5       # seconds between MQTT publishes
 MOTOHOURS_SAVE_INTERVAL_S = 60  # seconds between flash writes
@@ -53,8 +54,27 @@ WDT_TIMEOUT_MS = 60000       # if main loop hangs this long (power-glitch freeze
 
 # --- OTA (masofadan yangilash, GitHub'dan) ---
 OTA_ENABLED = True
-OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32/main.py"
+OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32_zavod3/main.py"
 OTA_CHECK_INTERVAL_S = 86400  # kuniga bir marta tekshiradi (kod kamdan-kam o'zgargani uchun yetarli)
+
+
+def load_threshold():
+    try:
+        with open(THRESHOLD_FILE) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return DEFAULT_AMP_THRESHOLD
+
+
+def save_threshold(value):
+    tmp_file = THRESHOLD_FILE + ".tmp"
+    with open(tmp_file, "w") as f:
+        f.write(str(value))
+    import os
+    os.rename(tmp_file, THRESHOLD_FILE)
+
+
+amp_threshold = load_threshold()  # ishga tushishda faylidan (yoki standart 1.5) o'qiladi
 
 # ---------------------------------------------------------------------------
 # WIFI
@@ -279,6 +299,7 @@ def check_for_update():
 # ---------------------------------------------------------------------------
 
 def mqtt_message_callback(topic, msg):
+    global amp_threshold
     if topic == MQTT_COMMAND_TOPIC:
         cmd = msg.decode("utf-8", "ignore").strip()
         print("[MQTT] buyruq keldi:", cmd)
@@ -287,6 +308,14 @@ def mqtt_message_callback(topic, msg):
                 check_for_update()
             except Exception as e:
                 print("[OTA] masofadan buyruq bilan tekshirishda xato:", e)
+        elif cmd.startswith("SET_THRESHOLD|"):
+            try:
+                value = float(cmd.split("|", 1)[1])
+                amp_threshold = value
+                save_threshold(value)
+                print("[THRESHOLD] yangi chegara o'rnatildi:", value)
+            except Exception as e:
+                print("[THRESHOLD] xato:", e)
 
 
 def mqtt_connect():
@@ -441,6 +470,16 @@ def check_serial_commands():
         except Exception as e:
             print("[OTA] qo'lda tekshirishda xato:", e)
 
+    elif line.startswith("SET_THRESHOLD|"):
+        global amp_threshold
+        try:
+            value = float(line.split("|", 1)[1])
+            amp_threshold = value
+            save_threshold(value)
+            print("THRESHOLD_SET_OK|" + str(value))
+        except Exception as e:
+            print("THRESHOLD_SET_ERROR|" + str(e))
+
 
 # ---------------------------------------------------------------------------
 # MAIN LOOP
@@ -497,7 +536,7 @@ def main():
             reading = pzem_read()
 
             if reading is not None:
-                status = "ON" if reading["current"] > AMP_THRESHOLD else "OFF"
+                status = "ON" if reading["current"] > amp_threshold else "OFF"
                 if status == "ON":
                     motohours += dt_hours
 

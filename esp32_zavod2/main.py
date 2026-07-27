@@ -1,5 +1,5 @@
 """
-ZAVOD 1 - Drobilka runtime & energy monitor
+ZAVOD 2 - Drobilka runtime & energy monitor
 ESP32 / MicroPython v1.28.0
 PZEM-004T (UART2, TX=17, RX=16) -> moto-hours calc -> HiveMQ Cloud (MQTT/SSL)
 """
@@ -36,10 +36,10 @@ def load_mqtt_config():
 
 MQTT_BROKER, MQTT_USER, MQTT_PASSWORD = load_mqtt_config()
 MQTT_PORT = 8883
-MQTT_CLIENT_ID = "esp32-zavod1-" + "".join("{:02x}".format(b) for b in machine.unique_id())
-MQTT_TOPIC = b"zavod1/data"
-MQTT_EVENTS_TOPIC = b"zavod1/events"
-MQTT_COMMAND_TOPIC = b"zavod1/command"
+MQTT_CLIENT_ID = "esp32-zavod2-" + "".join("{:02x}".format(b) for b in machine.unique_id())
+MQTT_TOPIC = b"zavod2/data"
+MQTT_EVENTS_TOPIC = b"zavod2/events"
+MQTT_COMMAND_TOPIC = b"zavod2/command"
 MQTT_KEEPALIVE = 60
 
 DEFAULT_AMP_THRESHOLD = 1.5  # Amps - fayl bo'lmasa shu qiymat ishlatiladi
@@ -54,7 +54,7 @@ WDT_TIMEOUT_MS = 60000       # if main loop hangs this long (power-glitch freeze
 
 # --- OTA (masofadan yangilash, GitHub'dan) ---
 OTA_ENABLED = True
-OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32_zavod1/main.py"
+OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32_zavod2/main.py"
 OTA_CHECK_INTERVAL_S = 86400  # kuniga bir marta tekshiradi (kod kamdan-kam o'zgargani uchun yetarli)
 
 

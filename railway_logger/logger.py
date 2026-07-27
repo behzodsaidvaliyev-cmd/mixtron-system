@@ -21,7 +21,7 @@ EVENTS_TOPIC_FILTER = "+/events"
 DB_PATH = os.environ.get("DB_PATH", "/data/mixtron.db")
 HTTP_PORT = int(os.environ.get("PORT", "8080"))
 UZ_OFFSET = 5 * 3600  # O'zbekiston UTC+5
-DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "mixtron2")  # ?zavod= berilmasa, shu ishlatiladi
+DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "zavod3")  # ?zavod= berilmasa, shu ishlatiladi
 
 db_lock = threading.Lock()
 
@@ -174,6 +174,12 @@ def compute_hours_today(conn, device):
     return compute_hours_range(conn, device, local_midnight_utc_ts(today_local), now_utc)
 
 
+def compute_hours_month(conn, device):
+    now_utc = time.time()
+    month_start_local = time.strftime("%Y-%m-01", time.gmtime(now_utc + UZ_OFFSET))
+    return compute_hours_range(conn, device, local_midnight_utc_ts(month_start_local), now_utc)
+
+
 def parse_time_param(value, default):
     """Qiymat Unix vaqt yoki mahalliy sana/vaqt satri ('YYYY-MM-DD HH:MM') bo'lishi mumkin."""
     if value is None:
@@ -184,40 +190,117 @@ def parse_time_param(value, default):
         return local_str_to_utc_ts(value.replace("T", " "))
 
 
+EVENTS_TABLE_STYLE = """
+        body{font-family:Arial,sans-serif;background:#1c2530;color:#ecf0f1;padding:24px}
+        h2{color:#f1c40f}
+        a.download{display:inline-block;margin-bottom:16px;color:#fff;background:#2ecc71;
+            padding:8px 14px;border-radius:4px;text-decoration:none;font-weight:bold}
+        table{border-collapse:collapse;width:100%;background:#2c3e50}
+        th,td{border:1px solid #445;padding:8px 12px;text-align:left}
+        th{background:#34495e}
+        tr:nth-child(even){background:#25303d}
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error(self, code, message):
+        body = str(message).encode()
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
-
+        conn = self.server.db_conn
         device = params.get("zavod", [DEFAULT_DEVICE])[0]
 
         if parsed.path == "/today_hours":
-            hours = compute_hours_today(self.server.db_conn, device)
-            body = json.dumps({"zavod": device, "hours_today": round(hours, 3)}).encode()
+            hours = compute_hours_today(conn, device)
+            self._send_json({"zavod": device, "hours_today": round(hours, 3)})
+
+        elif parsed.path == "/month_hours":
+            hours = compute_hours_month(conn, device)
+            self._send_json({"zavod": device, "hours_month": round(hours, 3)})
 
         elif parsed.path == "/hours":
             try:
                 now_utc = time.time()
                 from_ts = parse_time_param(params.get("from", [None])[0], now_utc - 86400)
                 to_ts = parse_time_param(params.get("to", [None])[0], now_utc)
-                hours = compute_hours_range(self.server.db_conn, device, from_ts, to_ts)
-                body = json.dumps({"zavod": device, "from": from_ts, "to": to_ts, "hours": round(hours, 3)}).encode()
+                hours = compute_hours_range(conn, device, from_ts, to_ts)
+                self._send_json({"zavod": device, "from": from_ts, "to": to_ts, "hours": round(hours, 3)})
             except Exception as e:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(str(e).encode())
-                return
+                self._send_error(400, e)
+
+        elif parsed.path == "/events":
+            limit = int(params.get("limit", ["200"])[0])
+            with db_lock:
+                rows = conn.execute(
+                    "SELECT event_time_local, event_type, motosoat FROM cycle_events "
+                    "WHERE device = ? ORDER BY event_ts DESC LIMIT ?",
+                    (device, limit),
+                ).fetchall()
+            self._send_json({
+                "zavod": device,
+                "events": [{"vaqt": r[0], "holat": r[1], "motosoat": r[2]} for r in rows],
+            })
+
+        elif parsed.path == "/events.csv":
+            with db_lock:
+                rows = conn.execute(
+                    "SELECT event_time_local, event_type, motosoat FROM cycle_events "
+                    "WHERE device = ? ORDER BY event_ts ASC",
+                    (device,),
+                ).fetchall()
+            lines = ["Vaqt,Holat,Motosoat"]
+            for r in rows:
+                lines.append("{},{},{}".format(r[0], r[1], r[2]))
+            body = ("\n".join(lines)).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="{}_voqealar.csv"'.format(device))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path == "/events.html":
+            with db_lock:
+                rows = conn.execute(
+                    "SELECT event_time_local, event_type, motosoat FROM cycle_events "
+                    "WHERE device = ? ORDER BY event_ts DESC LIMIT 300",
+                    (device,),
+                ).fetchall()
+            table_rows = "".join(
+                "<tr><td>{}</td><td>{}</td><td>{:.4f}</td></tr>".format(r[0], r[1], r[2])
+                for r in rows
+            )
+            html = (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<title>{device} - voqealar</title><style>{style}</style></head><body>"
+                "<h2>{device} - ON/OFF voqealari</h2>"
+                "<a class='download' href='/events.csv?zavod={device}'>Excel (CSV) yuklab olish</a>"
+                "<table><tr><th>Vaqt</th><th>Holat</th><th>Motosoat</th></tr>{rows}</table>"
+                "</body></html>"
+            ).format(device=device, style=EVENTS_TABLE_STYLE, rows=table_rows)
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         else:
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            self._send_error(404, "not found")
 
     def log_message(self, format, *args):
         pass  # standart konsolni shovqindan tozalash
