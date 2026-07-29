@@ -286,6 +286,33 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif parsed.path == "/readings.csv":
+            try:
+                now_utc = time.time()
+                from_ts = parse_time_param(params.get("from", [None])[0], now_utc - 3600)
+                to_ts = parse_time_param(params.get("to", [None])[0], now_utc)
+            except Exception as e:
+                self._send_error(400, e)
+                return
+
+            with db_lock:
+                rows = conn.execute(
+                    "SELECT received_ts, status, volt, amp, watt, motosoat, energy, freq, pf FROM readings "
+                    "WHERE device = ? AND received_ts BETWEEN ? AND ? ORDER BY received_ts ASC",
+                    (device, from_ts, to_ts),
+                ).fetchall()
+            lines = ["Vaqt,Status,Volt,Amper,Watt,Motosoat,Energiya,Chastota,CosPhi"]
+            for r in rows:
+                vaqt = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r[0] + UZ_OFFSET)) if r[0] else ""
+                lines.append(",".join([vaqt] + [str(v) for v in r[1:]]))
+            body = ("\n".join(lines)).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="{}_malumotlar.csv"'.format(device))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif parsed.path == "/events.html":
             with db_lock:
                 rows = conn.execute(
