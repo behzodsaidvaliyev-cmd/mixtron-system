@@ -275,10 +275,10 @@ class Handler(BaseHTTPRequestHandler):
                     "WHERE device = ? ORDER BY event_ts ASC",
                     (device,),
                 ).fetchall()
-            lines = ["Vaqt,Holat,Motosoat"]
+            lines = ["Vaqt;Holat;Motosoat"]
             for r in rows:
-                lines.append("{},{},{}".format(r[0], r[1], r[2]))
-            body = ("\n".join(lines)).encode("utf-8")
+                lines.append("{};{};{}".format(r[0], r[1], str(r[2]).replace(".", ",")))
+            body = b"\xef\xbb\xbf" + ("\n".join(lines)).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header("Content-Disposition", 'attachment; filename="{}_voqealar.csv"'.format(device))
@@ -301,11 +301,11 @@ class Handler(BaseHTTPRequestHandler):
                     "WHERE device = ? AND received_ts BETWEEN ? AND ? ORDER BY received_ts ASC",
                     (device, from_ts, to_ts),
                 ).fetchall()
-            lines = ["Vaqt,Status,Volt,Amper,Watt,Motosoat,Energiya,Chastota,CosPhi"]
+            lines = ["Vaqt;Status;Volt;Amper;Watt;Motosoat;Energiya;Chastota;CosPhi"]
             for r in rows:
                 vaqt = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r[0] + UZ_OFFSET)) if r[0] else ""
-                lines.append(",".join([vaqt] + [str(v) for v in r[1:]]))
-            body = ("\n".join(lines)).encode("utf-8")
+                lines.append(";".join([vaqt] + [str(v).replace(".", ",") for v in r[1:]]))
+            body = b"\xef\xbb\xbf" + ("\n".join(lines)).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header("Content-Disposition", 'attachment; filename="{}_malumotlar.csv"'.format(device))
