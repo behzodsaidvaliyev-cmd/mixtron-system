@@ -43,6 +43,7 @@ MQTT_COMMAND_TOPIC = b"zavod2/command"
 MQTT_KEEPALIVE = 60
 
 DEFAULT_AMP_THRESHOLD = 1.5  # Amps - fayl bo'lmasa shu qiymat ishlatiladi
+WIFI_RETRY_INTERVAL_S = 30   # boot vaqtida WiFi ulanmasa, shuncha soniyada qayta urinadi (abadiy kutib qolmaydi)
 POLL_INTERVAL_S = 2          # seconds between PZEM reads
 PUBLISH_INTERVAL_S = 5       # seconds between MQTT publishes
 MOTOHOURS_SAVE_INTERVAL_S = 60  # seconds between flash writes
@@ -154,10 +155,26 @@ uart = UART(2, baudrate=9600, tx=Pin(17), rx=Pin(16), bits=8, parity=None, stop=
 
 wdt = None  # set in main() once WDT is started
 
+PZEM_REINIT_AFTER_FAILS = 10    # ~20 soniya ketma-ket javobsizlikdan keyin UART'ni qayta ishga tushiradi
+PZEM_REBOOT_AFTER_FAILS = 150   # ~5 daqiqa ketma-ket javobsizlikdan keyin ESP32 o'zini qayta yuklaydi
+pzem_fail_count = 0
+
 
 def feed_wdt():
     if wdt is not None:
         wdt.feed()
+
+
+def reinit_uart():
+    """PZEM elektr o'chib-yonishidan keyin UART qotib qolsa, uni qayta ishga tushiradi."""
+    global uart
+    try:
+        uart.deinit()
+    except Exception:
+        pass
+    time.sleep_ms(100)
+    uart = UART(2, baudrate=9600, tx=Pin(17), rx=Pin(16), bits=8, parity=None, stop=1, timeout=200)
+    print("[PZEM] UART qayta ishga tushirildi (ketma-ket javobsizlikdan keyin)")
 
 
 def modbus_crc16(data):
@@ -486,23 +503,27 @@ def check_serial_commands():
 # ---------------------------------------------------------------------------
 
 def main():
-    global wdt
+    global wdt, pzem_fail_count
     wdt = WDT(timeout=WDT_TIMEOUT_MS)
 
-    try:
-        connect_wifi()
-        sync_time()
-    except Exception as e:
-        print("[WIFI] connect failed:", e)
+    wifi_ready = False
+    while not wifi_ready:
         try:
-            network.WLAN(network.STA_IF).disconnect()  # radio bo'shatiladi - scan toza ishlashi uchun
-        except Exception:
-            pass
-        print("[WIFI] offline recovery mode - kutmoqda: SCAN_WIFI / SET_WIFI (serial)")
-        while True:
-            feed_wdt()
-            check_serial_commands()
-            time.sleep(0.05)
+            connect_wifi()
+            sync_time()
+            wifi_ready = True
+        except Exception as e:
+            print("[WIFI] connect failed:", e)
+            try:
+                network.WLAN(network.STA_IF).disconnect()  # radio bo'shatiladi - scan toza ishlashi uchun
+            except Exception:
+                pass
+            print("[WIFI] offline recovery - {} soniyada qayta urinadi (SCAN_WIFI/SET_WIFI ham qabul qilinadi)".format(WIFI_RETRY_INTERVAL_S))
+            retry_start = time.time()
+            while time.time() - retry_start < WIFI_RETRY_INTERVAL_S:
+                feed_wdt()
+                check_serial_commands()
+                time.sleep(0.05)
 
     motohours = load_motohours()
     last_poll = time.time()
@@ -534,6 +555,17 @@ def main():
             last_poll = now
 
             reading = pzem_read()
+
+            if reading is None:
+                pzem_fail_count += 1
+                if pzem_fail_count == PZEM_REINIT_AFTER_FAILS:
+                    reinit_uart()
+                elif pzem_fail_count >= PZEM_REBOOT_AFTER_FAILS:
+                    print("[PZEM] uzoq vaqt javobsiz, ESP32 qayta yuklanmoqda...")
+                    time.sleep(1)
+                    machine.reset()
+            else:
+                pzem_fail_count = 0
 
             if reading is not None:
                 status = "ON" if reading["current"] > amp_threshold else "OFF"
