@@ -155,8 +155,7 @@ uart = UART(2, baudrate=9600, tx=Pin(17), rx=Pin(16), bits=8, parity=None, stop=
 
 wdt = None  # set in main() once WDT is started
 
-PZEM_REINIT_AFTER_FAILS = 10    # ~20 soniya ketma-ket javobsizlikdan keyin UART'ni qayta ishga tushiradi
-PZEM_REBOOT_AFTER_FAILS = 150   # ~5 daqiqa ketma-ket javobsizlikdan keyin ESP32 o'zini qayta yuklaydi
+PZEM_REINIT_AFTER_FAILS = 10    # har ~20 soniyalik ketma-ket javobsizlikdan keyin UART'ni qayta ishga tushiradi
 pzem_fail_count = 0
 
 
@@ -558,12 +557,11 @@ def main():
 
             if reading is None:
                 pzem_fail_count += 1
-                if pzem_fail_count == PZEM_REINIT_AFTER_FAILS:
+                # Diqqat: bu yerda majburan reboot QILINMAYDI - PZEM uzoq vaqt (masalan
+                # tungi svet o'chishida soatlab) javobsiz turishi NORMAL holat, xato emas.
+                # Faqat UART davriy ravishda tozalanadi, agar u haqiqatan qotib qolgan bo'lsa.
+                if pzem_fail_count % PZEM_REINIT_AFTER_FAILS == 0:
                     reinit_uart()
-                elif pzem_fail_count >= PZEM_REBOOT_AFTER_FAILS:
-                    print("[PZEM] uzoq vaqt javobsiz, ESP32 qayta yuklanmoqda...")
-                    time.sleep(1)
-                    machine.reset()
             else:
                 pzem_fail_count = 0
 
