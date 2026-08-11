@@ -10,12 +10,37 @@ import network
 import time
 import ssl
 import gc
+import socket
 from machine import UART, Pin, WDT
 
 try:
     from umqtt.simple import MQTTClient
 except ImportError:
     raise RuntimeError("umqtt.simple not found - install with: mip.install('umqtt.simple')")
+
+# ---------------------------------------------------------------------------
+# TARMOQ XAVFSIZLIGI: barcha socketlarga standart vaqt chegarasi (timeout)
+# ---------------------------------------------------------------------------
+# umqtt.simple va urequests o'z ichida socket yaratganda hech qanday timeout
+# qo'ymaydi - agar tarmoq g'alati holatga tushib qolsa (masalan broker bilan
+# yarim uzilgan ulanish), kod ABADIY kutib qolishi mumkin edi. Shu sabab
+# ESP32 uch marta ham "qotib qolgan" edi. Endi HAR BIR socket avtomatik
+# 15 soniyadan ortiq kutmaydi - shundan keyin xato qaytaradi, kod darhol
+# buni ushlab, normal qayta urinadi.
+SOCKET_TIMEOUT_S = 15
+_orig_socket_new = socket.socket
+
+
+def _socket_with_timeout(*args, **kwargs):
+    s = _orig_socket_new(*args, **kwargs)
+    try:
+        s.settimeout(SOCKET_TIMEOUT_S)
+    except Exception:
+        pass
+    return s
+
+
+socket.socket = _socket_with_timeout
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -26,6 +51,9 @@ MQTT_CONFIG_FILE = "mqtt_config.json"  # faqat qurilmada turadi, GitHub'ga hech 
 MOTOHOURS_FILE = "motohours.txt"
 EVENTS_QUEUE_FILE = "events_queue.txt"  # internet yo'q paytda ON/OFF voqealari shu yerda kutadi
 THRESHOLD_FILE = "threshold.txt"  # har ESP32 o'zining amper chegarasini shu yerda saqlaydi
+REBOOT_COUNT_FILE = "wdt_reboot_count.txt"  # ketma-ket WDT qayta yuklanishlarini kuzatadi
+MAX_RAPID_WDT_REBOOTS = 5    # shu sondan ko'p ketma-ket WDT reboot bo'lsa, sovutish boshlanadi
+WDT_COOLDOWN_S = 120         # sovutish davomiyligi (soniya)
 
 
 def load_mqtt_config():
@@ -498,11 +526,62 @@ def check_serial_commands():
 
 
 # ---------------------------------------------------------------------------
+# QOTIB QOLISH TSIKLINI KUZATISH
+# ---------------------------------------------------------------------------
+
+def handle_boot_reset_tracking():
+    """Agar ESP32 ketma-ket bir necha marta WDT (qotib qolish) sababli qayta
+    yuklangan bo'lsa, biroz 'sovushi' uchun kutib turadi - shunda tarmoq/server
+    tomonidagi vaqtinchalik muammo tufayli cheksiz tez-tez qayta yuklanish
+    tsikliga tushib qolmaydi. Oddiy elektr yoqilishi (POWERON_RESET) yoki
+    o'zimiz atayin qilgan reset (OTA, SET_WIFI) hisobga olinmaydi."""
+    try:
+        cause = machine.reset_cause()
+        is_wdt_reset = hasattr(machine, "WDT_RESET") and cause == machine.WDT_RESET
+    except Exception:
+        is_wdt_reset = False
+
+    try:
+        with open(REBOOT_COUNT_FILE) as f:
+            count = int(f.read().strip())
+    except (OSError, ValueError):
+        count = 0
+
+    if is_wdt_reset:
+        count += 1
+        print("[BOOT] WDT orqali qayta yuklandi, ketma-ket soni:", count)
+    else:
+        count = 0  # oddiy yoqilish yoki atayin reset - hisoblagich tozalanadi
+
+    try:
+        tmp = REBOOT_COUNT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(count))
+        import os
+        os.rename(tmp, REBOOT_COUNT_FILE)
+    except Exception:
+        pass
+
+    if count >= MAX_RAPID_WDT_REBOOTS:
+        print("[BOOT] {} marta ketma-ket qotib qolgandan keyin qayta yuklandi - {} soniya sovutish".format(count, WDT_COOLDOWN_S))
+        time.sleep(WDT_COOLDOWN_S)
+        try:
+            tmp = REBOOT_COUNT_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(str(count // 2))  # keyingi safar darhol yana sovutmasin, sekin pasayadi
+            import os
+            os.rename(tmp, REBOOT_COUNT_FILE)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 
 def main():
     global wdt, pzem_fail_count
+    handle_boot_reset_tracking()
     wdt = WDT(timeout=WDT_TIMEOUT_MS)
 
     wifi_ready = False
