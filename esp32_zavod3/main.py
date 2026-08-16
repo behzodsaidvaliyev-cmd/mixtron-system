@@ -68,6 +68,12 @@ OTA_ENABLED = True
 OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32_zavod3/main.py"
 OTA_CHECK_INTERVAL_S = 86400    # kuniga bir marta
 OTA_END_MARKER = "OTA-FAYL-OXIRI"  # fayl oxirida turadi; yuklash to'liqligini isbotlaydi
+OTA_PREV_FILE = "main_prev.py"     # OTA'dan oldingi ISHLAYDIGAN kod (orqaga qaytish uchun)
+OTA_PENDING_FILE = "ota_pending.txt"  # yangi kod hali barqarorligi tasdiqlanmagan belgisi
+OTA_STABLE_AFTER_S = 180        # shuncha vaqt muammosiz ishlasa, yangi kod "yaxshi"
+OTA_MAX_BOOT_ATTEMPTS = 2       # yangi kodga shuncha yoqilish imkoni beriladi
+
+NTP_RESYNC_INTERVAL_S = 86400   # ESP32 soati sekin adashadi - kuniga bir marta to'g'rilanadi
 
 UNIX_EPOCH_OFFSET = 946684800   # MicroPython 2000-yildan, Unix 1970-yildan sanaydi
 
@@ -168,6 +174,33 @@ def _atomic_write(path, text):
     with open(tmp, "w") as f:
         f.write(text)
     _replace(tmp, path)
+
+
+def _safe_remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _exists(path):
+    try:
+        os.stat(path)
+        return True
+    except OSError:
+        return False
+
+
+def _copy_file(src, dst):
+    """Bo'lakma-bo'lak nusxalash (RAM'ni to'ldirmasdan)."""
+    tmp = dst + ".tmp"
+    with open(src, "rb") as fs, open(tmp, "wb") as fd:
+        while True:
+            chunk = fs.read(512)
+            if not chunk:
+                break
+            fd.write(chunk)
+    _replace(tmp, dst)
 
 
 def _read_float(path, default):
@@ -498,10 +531,69 @@ def check_for_update():
         print("[OTA] o'zgarish yo'q")
         return False
 
+    # ORQAGA QAYTISH HIMOYASI: joriy (ishlayotgani aniq) kod zaxiraga olinadi va
+    # "hali tasdiqlanmagan" belgisi qo'yiladi. Agar yangi kod barqaror ishlamasa
+    # (qotib qolsa, WDT qayta yuklasa), keyingi yoqilishda ESKI VERSIYA O'ZI
+    # TIKLANADI. Busiz nosoz yangilanish uch zavodni ham birdan o'ldirishi mumkin
+    # va har biriga borib qo'lda tuzatishga to'g'ri kelardi.
+    try:
+        _copy_file("main.py", OTA_PREV_FILE)
+        _atomic_write(OTA_PENDING_FILE, "1")
+    except Exception as e:
+        print("[OTA] zaxira olinmadi, yangilash bekor qilindi:", e)
+        _safe_remove(tmp_path)
+        return False
+
     _replace(tmp_path, "main.py")
     print("[OTA] yangi kod o'rnatildi, qayta yuklanmoqda...")
     time.sleep(1)
     machine.reset()
+
+
+def handle_ota_rollback():
+    """Yoqilishda chaqiriladi. Yangi OTA kodiga bir necha yoqilish imkoni
+    beriladi; shuncha urinishdan keyin ham barqarorlik tasdiqlanmasa, eski
+    versiya tiklanadi.
+
+    Belgidagi son = yangi kod bilan nechinchi marta yoqilgani. Buni sanamasak,
+    yangi kod BIRINCHI yoqilishdayoq orqaga qaytarilib, hech qachon ishlay
+    olmagan bo'lardi."""
+    if not _exists(OTA_PENDING_FILE):
+        return
+    if not _exists(OTA_PREV_FILE):
+        _safe_remove(OTA_PENDING_FILE)
+        return
+
+    try:
+        with open(OTA_PENDING_FILE) as f:
+            attempts = int(f.read().strip())
+    except (OSError, ValueError):
+        attempts = 0
+
+    if attempts < OTA_MAX_BOOT_ATTEMPTS:
+        try:
+            _atomic_write(OTA_PENDING_FILE, str(attempts + 1))
+        except Exception:
+            pass
+        print("[OTA] yangi kod sinovda ({}/{}-yoqilish)".format(
+            attempts + 1, OTA_MAX_BOOT_ATTEMPTS))
+        return
+
+    print("[OTA] yangi kod {} marta barqaror ishlamadi - ESKI VERSIYA tiklanmoqda".format(attempts))
+    _safe_remove(OTA_PENDING_FILE)
+    try:
+        _copy_file(OTA_PREV_FILE, "main.py")
+        time.sleep(1)
+        machine.reset()
+    except Exception as e:
+        print("[OTA] orqaga qaytishda xato:", e)
+
+
+def confirm_ota_stable():
+    """Yangi kod yetarli vaqt muammosiz ishladi - belgi olib tashlanadi."""
+    if _exists(OTA_PENDING_FILE):
+        _safe_remove(OTA_PENDING_FILE)
+        print("[OTA] yangi kod barqaror deb tasdiqlandi")
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +944,8 @@ def main():
     if not boot_safe_window():
         return  # xavfsiz rejim: WDT yoqilmaydi, REPL bilan ishlash mumkin
 
+    handle_ota_rollback()   # nosoz OTA'dan keyin eski versiyani tiklaydi
+
     wdt = WDT(timeout=WDT_TIMEOUT_MS)
     print("[BOOT] WDT yoqildi ({} ms)".format(WDT_TIMEOUT_MS))
 
@@ -880,7 +974,14 @@ def main():
     last_ota_check = now
     last_wifi_check = now
     last_ntp_retry = now
+    last_ntp_resync = now
+    boot_mono = uptime_s()             # OTA barqarorligini o'lchash uchun
     saved_motohours = motohours        # flesh'ga keraksiz yozmaslik uchun
+
+    # Yoqilish xabari: Railway'da ko'rinadi. Qurilma tez-tez qayta yuklanayotgan
+    # bo'lsa (nosozlik alomati) buni darhol payqash mumkin - avval uch qurilma
+    # 6 kun jim turgani sezilmay qolgan edi.
+    queue_event("BOOT", motohours)
 
     client = None
     try:
@@ -892,6 +993,20 @@ def main():
         feed_wdt()
         check_serial_commands()
         now = time.time()
+
+        # --- Yangi OTA kodi yetarli vaqt ishladi -> "barqaror" deb belgilanadi ---
+        if boot_mono is not None and uptime_s() - boot_mono >= OTA_STABLE_AFTER_S:
+            boot_mono = None
+            confirm_ota_stable()
+
+        # --- Soatni davriy to'g'rilash (ESP32 soati sekin adashadi) ---
+        if wifi_is_up() and time_is_valid() and now - last_ntp_resync >= NTP_RESYNC_INTERVAL_S:
+            last_ntp_resync = now
+            if sync_time():
+                now = time.time()
+                last_poll = now        # vaqt siljigan bo'lishi mumkin - taymerlar tiklanadi
+                last_publish = last_save = last_check_msg = now
+                last_wifi_check = last_ntp_retry = now
 
         # --- WiFi salomatligi ---
         # MUHIM: ishlash paytida WiFi uzilib qolsa (router qayta yuklandi,

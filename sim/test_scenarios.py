@@ -242,6 +242,61 @@ def run_all():
     check("PZEM o'qish to'xtamadi", True)
 
     # =====================================================================
+    print("\n=== 11. NOSOZ OTA yangilanishidan keyin AVTOMATIK ORQAGA QAYTISH ===")
+    W.__init__()
+    new_device(tmp)
+    good = open(os.path.join(tmp, "main.py"), encoding="utf-8").read()
+    # "Eski, ishlaydigan" versiya zaxirada; main.py esa "yangi nosoz" kod
+    with open(os.path.join(tmp, "main_prev.py"), "w", encoding="utf-8") as f:
+        f.write(good)
+    with open(os.path.join(tmp, "ota_pending.txt"), "w") as f:
+        f.write("2")                    # imkoniyatlar tugagan -> rollback bo'lishi shart
+    with open(os.path.join(tmp, "main.py"), "a", encoding="utf-8") as f:
+        f.write("\n# YANGI NOSOZ VERSIYA BELGISI\n")
+    out = boot(30)
+    restored = open(os.path.join(tmp, "main.py"), encoding="utf-8").read()
+    check("nosoz yangilanish o'rniga eski versiya tiklandi",
+          "YANGI NOSOZ VERSIYA BELGISI" not in restored, out)
+    check("'tasdiqlanmagan' belgisi tozalandi",
+          not os.path.exists(os.path.join(tmp, "ota_pending.txt")))
+
+    print("\n=== 12. Yangi OTA kodiga ishlash imkoni beriladi (darrov qaytarilmaydi) ===")
+    W.__init__()
+    new_device(tmp)
+    with open(os.path.join(tmp, "main_prev.py"), "w", encoding="utf-8") as f:
+        f.write(good)
+    with open(os.path.join(tmp, "ota_pending.txt"), "w") as f:
+        f.write("0")                    # OTA endigina o'rnatdi: 0-urinish
+    with open(os.path.join(tmp, "main.py"), "a", encoding="utf-8") as f:
+        f.write("\n# YANGI VERSIYA BELGISI\n")
+    out = boot(60)                      # qisqa: hali barqaror deb tasdiqlanmaydi
+    still_new = "YANGI VERSIYA BELGISI" in open(os.path.join(tmp, "main.py"), encoding="utf-8").read()
+    check("birinchi yoqilishda ORQAGA QAYTARILMADI", still_new, out)
+    attempts = open(os.path.join(tmp, "ota_pending.txt")).read().strip() \
+        if os.path.exists(os.path.join(tmp, "ota_pending.txt")) else "yo'q"
+    check("urinish soni sanaldi", attempts == "1", "belgi={}".format(attempts))
+
+    print("\n=== 12b. Uzoq muammosiz ishlagach 'barqaror' deb tasdiqlanadi ===")
+    W.__init__()
+    out = boot(400)                     # OTA_STABLE_AFTER_S = 180
+    check("belgi olib tashlandi (rollback endi bo'lmaydi)",
+          not os.path.exists(os.path.join(tmp, "ota_pending.txt")), out)
+
+    print("\n=== 13. Yoqilish xabari Railway'ga ketyaptimi ===")
+    W.__init__()
+    new_device(tmp)
+    for f in ("events_queue.txt", "last_status.txt", "ota_pending.txt"):
+        try:
+            os.remove(os.path.join(tmp, f))
+        except OSError:
+            pass
+    before = len(event_lines())
+    boot(90)
+    boots = [e for e in event_lines()[before:] if "|BOOT|" in e]
+    check("BOOT voqeasi yuborildi", len(boots) > 0,
+          boots[0] if boots else "yo'q")
+
+    # =====================================================================
     print("\n" + "=" * 62)
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)
