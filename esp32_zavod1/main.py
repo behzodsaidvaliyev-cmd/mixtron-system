@@ -48,6 +48,9 @@ CHECK_MSG_INTERVAL_S = 1        # MQTT buyruqlarni tekshirish oralig'i
 
 WIFI_CONNECT_TIMEOUT_S = 15
 WIFI_RETRY_INTERVAL_S = 20      # ulanmasa, shuncha soniyada qayta urinadi
+WIFI_HEALTH_INTERVAL_S = 30     # ish paytida WiFi uzilmaganini tekshirish oralig'i
+NTP_RETRY_INTERVAL_S = 60       # vaqt sozlanmagan bo'lsa, qayta urinish oralig'i
+MAX_SANE_DT_S = 300             # bundan katta vaqt farqi = soat sakragan, hisobga olinmaydi
 
 PZEM_SLAVE_ADDR = 0xF8
 PZEM_DEBUG = False              # True qilinsa xom baytlarni chop etadi (nosozlik izlashda)
@@ -79,19 +82,35 @@ UNIX_EPOCH_OFFSET = 946684800   # MicroPython 2000-yildan, Unix 1970-yildan sana
 # bu MicroPython'da timeout'ni BEKOR QILADI. Shu sabab timeout har bir
 # check_msg()'dan keyin qayta tiklanadi (restore_socket_timeout()).
 
-_orig_socket = socket.socket
+def _install_socket_timeout(mod):
+    """Modul ichidagi socket yaratuvchini timeout qo'yadigan variantga almashtiradi."""
+    if getattr(mod, "_timeout_patched", False):
+        return
+    orig = mod.socket
+
+    def _patched(*args, **kwargs):
+        s = orig(*args, **kwargs)
+        try:
+            s.settimeout(SOCKET_TIMEOUT_S)
+        except Exception:
+            pass
+        return s
+
+    mod.socket = _patched
+    mod._timeout_patched = True
 
 
-def _socket_with_timeout(*args, **kwargs):
-    s = _orig_socket(*args, **kwargs)
-    try:
-        s.settimeout(SOCKET_TIMEOUT_S)
-    except Exception:
-        pass
-    return s
-
-
-socket.socket = _socket_with_timeout
+# MUHIM: umqtt "usocket" nomi bilan, urequests esa "socket" nomi bilan import
+# qilishi mumkin. Ba'zi MicroPython versiyalarida bular AYRIM modul obyektlari -
+# faqat bittasini tuzatsak, ikkinchisi himoyasiz qoladi (aynan MQTT qotib
+# qolardi). Shu sabab ikkalasi ham tuzatiladi.
+_install_socket_timeout(socket)
+try:
+    import usocket as _usocket
+    if _usocket is not socket:
+        _install_socket_timeout(_usocket)
+except ImportError:
+    pass
 
 
 def restore_socket_timeout(client):
@@ -174,7 +193,17 @@ def save_last_status(status):
         pass
 
 
-MQTT_BROKER, MQTT_USER, MQTT_PASSWORD = load_mqtt_config()
+# Konfig buzilgan/yo'q bo'lsa ham dastur ISHGA TUSHISHI kerak - aks holda
+# qurilma REPL'ga tushib, hech qanday buyruq qabul qilmay qoladi va uni faqat
+# to'liq qayta flash qilib tiklash mumkin bo'lardi.
+CONFIG_OK = True
+try:
+    MQTT_BROKER, MQTT_USER, MQTT_PASSWORD = load_mqtt_config()
+except Exception as _e:
+    CONFIG_OK = False
+    MQTT_BROKER, MQTT_USER, MQTT_PASSWORD = "", "", ""
+    print("[CONFIG] mqtt_config.json o'qilmadi:", _e)
+
 MQTT_CLIENT_ID = "esp32-" + DEVICE + "-" + "".join("{:02x}".format(b) for b in machine.unique_id())
 amp_threshold = load_threshold()
 
@@ -218,10 +247,26 @@ def wifi_is_up():
         return False
 
 
+time_synced = False
+
+
+def time_is_valid():
+    """NTP sozlanmagan bo'lsa, ESP32 vaqti 2000-yildan boshlanadi. Bunday
+    vaqt bilan yozilgan voqealar Railway'da 26 yil xato sana bilan tushadi,
+    hisobotlarni butunlay buzadi. Shu sabab vaqt haqiqiyligi tekshiriladi."""
+    # 2025-01-01 (MicroPython epoch'ida) dan katta bo'lsa - haqiqiy vaqt
+    return time.time() > 789000000
+
+
 def sync_time():
+    """NTP sinxronizatsiyasi. Vaqt SAKRAB ketishi mumkin (2000 -> 2026), shu
+    sabab chaqirgan joy taymerlarni qayta hisoblashi shart (aks holda
+    dt_hours ulkan chiqib, motosoatni butunlay buzib yuboradi)."""
+    global time_synced
     try:
         import ntptime
         ntptime.settime()
+        time_synced = True
         print("[TIME] NTP sozlandi (UTC):", time.localtime())
         return True
     except Exception as e:
@@ -476,6 +521,8 @@ def mqtt_message_callback(topic, msg):
 
 
 def mqtt_connect():
+    if not CONFIG_OK:
+        raise RuntimeError("mqtt_config.json yo'q/buzuq - MQTT ishlamaydi")
     gc.collect()  # SSL handshake uchun maksimal bo'sh xotira
     client = MQTTClient(
         client_id=MQTT_CLIENT_ID,
@@ -538,8 +585,23 @@ def _queue_line_count():
     return n
 
 
+_boot_ticks = time.ticks_ms()
+
+
+def uptime_s():
+    return time.ticks_diff(time.ticks_ms(), _boot_ticks) // 1000
+
+
 def queue_event(event_type, motosoat):
-    line = "EVENT|{}|{}|{:.4f}".format(int(time.time() + UNIX_EPOCH_OFFSET), event_type, motosoat)
+    # Agar NTP hali sozlanmagan bo'lsa (internetsiz yonganda), haqiqiy sana
+    # ma'lum emas. Bunday paytda vaqt o'rniga MANFIY "uptime belgisi" yoziladi.
+    # Yuborish paytida (vaqt allaqachon sozlangan bo'ladi) u haqiqiy sanaga
+    # aylantiriladi - shunday qilib oflayn voqealar ham to'g'ri vaqtga tushadi.
+    if time_is_valid():
+        ts = int(time.time() + UNIX_EPOCH_OFFSET)
+    else:
+        ts = -uptime_s()
+    line = "EVENT|{}|{}|{:.4f}".format(ts, event_type, motosoat)
     try:
         if _queue_line_count() >= EVENTS_QUEUE_MAX_LINES:
             print("[EVENT] navbat to'ldi, eng eskilari tashlab yuborildi")
@@ -568,6 +630,26 @@ def _trim_queue(keep_last):
         pass
 
 
+def _resolve_event_time(line):
+    """Manfiy vaqtli (oflayn yozilgan) voqeani haqiqiy sanaga aylantiradi.
+    Vaqt hali sozlanmagan bo'lsa None qaytaradi - voqea navbatda qoladi."""
+    try:
+        parts = line.split("|")
+        ts = int(parts[1])
+    except Exception:
+        return line          # tushunarsiz qator - o'z holicha yuboriladi
+    if ts >= 0:
+        return line
+    if not time_is_valid():
+        return None          # hali aniqlab bo'lmaydi
+    age = uptime_s() + ts    # ts manfiy: yozilganidan beri o'tgan soniyalar
+    if age < 0:
+        age = 0
+    real_ts = int(time.time() + UNIX_EPOCH_OFFSET) - age
+    parts[1] = str(real_ts)
+    return "|".join(parts)
+
+
 def flush_event_queue(client):
     """Navbatdagi voqealarni yuboradi. Fayl RAM'ga TO'LIQ o'qilmaydi -
     qatorma-qator o'qiladi (eski readlines() versiyasi MemoryError berardi)."""
@@ -592,8 +674,12 @@ def flush_event_queue(client):
                     dst.write(line + "\n")   # qolganlari saqlanadi
                     continue
                 feed_wdt()
+                out = _resolve_event_time(line)
+                if out is None:
+                    dst.write(line + "\n")   # vaqt hali noma'lum - keyinroq
+                    continue
                 try:
-                    client.publish(MQTT_EVENTS_TOPIC, line)
+                    client.publish(MQTT_EVENTS_TOPIC, out)
                     restore_socket_timeout(client)
                     sent += 1
                 except Exception as e:
@@ -670,8 +756,9 @@ def check_serial_commands():
             print("THRESHOLD_SET_ERROR|" + str(e))
 
     elif line == "STATUS":
-        print("STATUS|{}|thr={}|mem={}|wifi={}".format(
-            DEVICE, amp_threshold, gc.mem_free(), wifi_is_up()))
+        print("STATUS|{}|thr={}|mem={}|wifi={}|config={}|vaqt={}".format(
+            DEVICE, amp_threshold, gc.mem_free(), wifi_is_up(),
+            "OK" if CONFIG_OK else "XATO", "OK" if time_is_valid() else "SOZLANMAGAN"))
 
     elif line == "REBOOT":
         print("REBOOTING")
@@ -719,7 +806,6 @@ def main():
     while not wifi_is_up():
         try:
             connect_wifi()
-            sync_time()
         except Exception as e:
             print("[WIFI] xato:", e, "-", WIFI_RETRY_INTERVAL_S, "soniyada qayta urinadi")
             t0 = time.time()
@@ -727,6 +813,10 @@ def main():
                 feed_wdt()
                 check_serial_commands()
                 time.sleep(0.1)
+
+    # NTP HAR DOIM chaqiriladi (WiFi allaqachon ulangan holatda ham) - aks holda
+    # vaqt 2000-yilda qolib, barcha voqealar 26 yil xato sana bilan yoziladi.
+    sync_time()
 
     motohours = load_motohours()
     last_status = load_last_status()   # reboot'dan keyin soxta voqea yozilmaydi
@@ -736,6 +826,9 @@ def main():
     last_save = now
     last_check_msg = now
     last_ota_check = now
+    last_wifi_check = now
+    last_ntp_retry = now
+    saved_motohours = motohours        # flesh'ga keraksiz yozmaslik uchun
 
     client = None
     try:
@@ -747,6 +840,35 @@ def main():
         feed_wdt()
         check_serial_commands()
         now = time.time()
+
+        # --- WiFi salomatligi ---
+        # MUHIM: ishlash paytida WiFi uzilib qolsa (router qayta yuklandi,
+        # signal yo'qoldi), eski kod uni HECH QACHON qayta ulamas edi - qurilma
+        # abadiy "ko'r" holatda ishlab yuraverardi. Endi davriy tekshiriladi.
+        if now - last_wifi_check >= WIFI_HEALTH_INTERVAL_S:
+            last_wifi_check = now
+            if not wifi_is_up():
+                print("[WIFI] uzilgan - qayta ulanmoqda")
+                client = mqtt_close(client)
+                try:
+                    connect_wifi()
+                    if not time_is_valid():
+                        sync_time()
+                        now = time.time()          # NTP vaqtni sakratgan bo'lishi mumkin
+                        last_poll = now            # taymerlar qayta hisoblanadi
+                        last_publish = last_save = last_check_msg = now
+                        last_wifi_check = last_ntp_retry = now
+                except Exception as e:
+                    print("[WIFI] qayta ulanmadi:", e)
+
+        # --- NTP hali sozlanmagan bo'lsa, qayta urinish ---
+        if (not time_is_valid()) and wifi_is_up() and now - last_ntp_retry >= NTP_RETRY_INTERVAL_S:
+            last_ntp_retry = now
+            if sync_time():
+                now = time.time()                  # vaqt sakradi - taymerlarni tiklash
+                last_poll = now
+                last_publish = last_save = last_check_msg = now
+                last_wifi_check = last_ntp_retry = now
 
         # --- MQTT buyruqlarni tekshirish (sekundiga bir marta yetarli) ---
         if client is not None and now - last_check_msg >= CHECK_MSG_INTERVAL_S:
@@ -760,8 +882,16 @@ def main():
 
         # --- PZEM o'qish ---
         if now - last_poll >= POLL_INTERVAL_S:
-            dt_hours = (now - last_poll) / 3600.0
+            dt_raw = now - last_poll
             last_poll = now
+            # HIMOYA: vaqt sakrashi (NTP, soat nosozligi) dt'ni ulkan qilib,
+            # motosoatni butunlay buzib yuborishi mumkin - u esa flesh'ga
+            # saqlanadi, ya'ni xato ABADIY qolardi. Mantiqsiz qiymat rad etiladi.
+            if dt_raw < 0 or dt_raw > MAX_SANE_DT_S:
+                print("[TIME] mantiqsiz vaqt farqi ({}s) - motosoatga qo'shilmadi".format(dt_raw))
+                dt_hours = 0.0
+            else:
+                dt_hours = dt_raw / 3600.0
 
             reading = pzem_read()
 
@@ -790,6 +920,11 @@ def main():
                 queue_event(status, motohours)
                 last_status = status
                 save_last_status(status)
+                # Sikl tugagan payt - motosoatni darhol saqlash (quvvat shu
+                # zahoti uzilsa ham oxirgi ish vaqti yo'qolmasin)
+                if abs(motohours - saved_motohours) > 1e-6:
+                    save_motohours(motohours)
+                    saved_motohours = motohours
                 client = flush_event_queue(client)
 
             # --- MQTT'ga yuborish ---
@@ -803,9 +938,14 @@ def main():
                 client = mqtt_publish(client, MQTT_TOPIC, data_line)
 
             # --- Motosoatni saqlash + navbatni yuborishga urinish ---
+            # Faqat QIYMAT O'ZGARGANDA yoziladi. Drobilka o'chiq turganda
+            # motosoat o'zgarmaydi - eski kod baribir har daqiqada yozardi
+            # (kuniga 1440 marta), bu yillar davomida flesh xotirani eskirtiradi.
             if now - last_save >= MOTOHOURS_SAVE_INTERVAL_S:
                 last_save = now
-                save_motohours(motohours)
+                if abs(motohours - saved_motohours) > 1e-6:
+                    save_motohours(motohours)
+                    saved_motohours = motohours
                 client = flush_event_queue(client)
 
             # --- OTA (kuniga bir marta) ---
