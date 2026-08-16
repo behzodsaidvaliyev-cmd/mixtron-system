@@ -127,12 +127,18 @@ def on_message(client, userdata, msg):
     elif line.startswith("EVENT|"):
         try:
             parts = line.split("|")
-            event_ts, event_type, motosoat = parts[1], parts[2], parts[3]
-            event_time_local = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(event_ts) + UZ_OFFSET))
+            event_ts, event_type, motosoat = int(parts[1]), parts[2], parts[3]
+            # Qurilma vaqtni aniqlay olmagan bo'lsa (NTP bloklangan tarmoq)
+            # 0 yuboradi - bunda serverning O'Z soati ishlatiladi, aks holda
+            # voqea 1970-yil sanasi bilan yozilib, hisobotlarni buzardi.
+            if event_ts <= 0:
+                event_ts = int(time.time())
+                print("[EVENT] qurilmada vaqt yo'q edi - server vaqti qo'yildi")
+            event_time_local = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(event_ts + UZ_OFFSET))
             with db_lock:
                 conn.execute(
                     "INSERT INTO cycle_events (device, event_ts, event_time_local, event_type, motosoat) VALUES (?, ?, ?, ?, ?)",
-                    (device, int(event_ts), event_time_local, event_type, float(motosoat)),
+                    (device, event_ts, event_time_local, event_type, float(motosoat)),
                 )
                 conn.commit()
             print("[EVENT] saved ({}): {} at {} (mahalliy vaqt) motosoat = {}".format(device, event_type, event_time_local, motosoat))

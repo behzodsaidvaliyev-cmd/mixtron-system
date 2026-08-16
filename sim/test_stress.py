@@ -354,6 +354,40 @@ def run():
           "{} ta xato sana".format(len(bad_ts)))
 
     # =====================================================================
+    print("\n=== G. Tarmoq NTP'ni BLOKLAGAN (internet bor, vaqt yo'q) ===")
+    # Zavod tarmog'i UDP 123 ni yopib qo'ysa: MQTT ishlaydi, lekin soat
+    # hech qachon to'g'rilanmaydi. Voqealar navbatda abadiy qolib
+    # ketmasligi kerak.
+    W.__init__()
+    W.powered = False
+    W.wifi_up = True
+    W.wifi_can_connect = True
+    W.ntp_works = False                 # NTP bloklangan
+    W.broker = "ok"
+    W.clock = 100000.0                  # soat 2000-yilda
+    W.pzem = "ok"
+    W.pzem_current = 9.0
+    for f in ("events_queue.txt", "last_status.txt"):
+        try:
+            os.remove(os.path.join(tmp, f))
+        except OSError:
+            pass
+
+    before = len(W.published)
+    out = boot(900)                     # NTP_GIVEUP_S = 600 dan uzoq
+    sent = [p for t, p in W.published[before:] if t.endswith("/events")]
+    check("NTP bloklangan bo'lsa ham voqealar yuborildi", len(sent) > 0,
+          "{} ta".format(len(sent)))
+    if sent:
+        check("vaqtsiz voqea 0 belgisi bilan ketdi (server to'ldiradi)",
+              any(s.split("|")[1] == "0" for s in sent),
+              sent[-1])
+    qn = 0
+    if os.path.exists(q):
+        qn = len(_orig_open(q).read().strip().splitlines())
+    check("navbat to'planib qolmadi", qn < 5, "{} qator qoldi".format(qn))
+
+    # =====================================================================
     print("\n" + "=" * 64)
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)

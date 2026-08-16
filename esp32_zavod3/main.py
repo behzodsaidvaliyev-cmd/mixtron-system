@@ -75,6 +75,7 @@ OTA_STABLE_AFTER_S = 180        # shuncha vaqt muammosiz ishlasa, yangi kod "yax
 OTA_MAX_BOOT_ATTEMPTS = 2       # yangi kodga shuncha yoqilish imkoni beriladi
 
 NTP_RESYNC_INTERVAL_S = 86400   # ESP32 soati sekin adashadi - kuniga bir marta to'g'rilanadi
+NTP_GIVEUP_S = 600              # shuncha kutib NTP ishlamasa, voqealar vaqtsiz yuboriladi
 
 UNIX_EPOCH_OFFSET = 946684800   # MicroPython 2000-yildan, Unix 1970-yildan sanaydi
 
@@ -801,7 +802,15 @@ def _resolve_event_time(line):
     if ts >= 0:
         return line
     if not time_is_valid():
-        return None          # hali aniqlab bo'lmaydi
+        # Zavod tarmog'i NTP'ni (UDP 123) bloklab qo'ygan bo'lishi mumkin -
+        # bunda vaqt HECH QACHON to'g'rilanmaydi. Agar shu holat davom etsa,
+        # voqealar navbatda abadiy qolib, 500 taga yetgach eskisi o'chib
+        # ketardi - ya'ni JIMGINA yo'qolardi. Shu sabab uzoq kutgandan keyin
+        # vaqtsiz yuboriladi: server o'z soati bilan belgilaydi.
+        if uptime_s() < NTP_GIVEUP_S:
+            return None      # hali NTP tuzalishi mumkin - kutamiz
+        parts[1] = "0"       # "vaqt noma'lum" belgisi; serverda to'ldiriladi
+        return "|".join(parts[:4])
 
     same_boot = False
     if len(parts) >= 5:
@@ -835,6 +844,7 @@ def flush_event_queue(client):
         return client  # ulanish yo'q - keyingi safar
 
     sent = 0
+    kept = 0                 # navbatda QOLDIRILGAN qatorlar soni
     failed = False
     tmp = EVENTS_QUEUE_FILE + ".tmp"
     try:
@@ -845,11 +855,13 @@ def flush_event_queue(client):
                     continue
                 if failed:
                     dst.write(line + "\n")   # qolganlari saqlanadi
+                    kept += 1
                     continue
                 feed_wdt()
                 out = _resolve_event_time(line)
                 if out is None:
                     dst.write(line + "\n")   # vaqt hali noma'lum - keyinroq
+                    kept += 1
                     continue
                 try:
                     client.publish(MQTT_EVENTS_TOPIC, out)
@@ -860,8 +872,12 @@ def flush_event_queue(client):
                     client = mqtt_close(client)
                     failed = True
                     dst.write(line + "\n")
+                    kept += 1
         _replace(tmp, EVENTS_QUEUE_FILE)
-        if not failed:
+        # DIQQAT: faylni faqat HAMMA qator yuborilgan bo'lsa o'chirish mumkin.
+        # Avval "xato bo'lmasa o'chir" edi - natijada vaqti hali aniqlanmagan
+        # (yuborilmagan) voqealar JIMGINA O'CHIB KETARDI.
+        if kept == 0:
             try:
                 os.remove(EVENTS_QUEUE_FILE)
             except OSError:
