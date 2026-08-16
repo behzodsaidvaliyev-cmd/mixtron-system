@@ -33,6 +33,7 @@ MOTOHOURS_FILE = "motohours.txt"
 EVENTS_QUEUE_FILE = "events_queue.txt"  # internet yo'q paytda ON/OFF voqealari
 THRESHOLD_FILE = "threshold.txt"
 STATUS_FILE = "last_status.txt"         # reboot'dan keyin soxta voqea yozilmasligi uchun
+BOOT_ID_FILE = "boot_id.txt"            # oflayn voqea qaysi yoqilishda yozilganini bilish uchun
 
 MQTT_PORT = 8883
 MQTT_KEEPALIVE = 60
@@ -144,12 +145,29 @@ def set_wifi(ssid, password):
     _atomic_write(WIFI_CONFIG_FILE, ujson.dumps({"ssid": ssid, "password": password}))
 
 
+def _replace(src, dst):
+    """src -> dst ko'chirish, dst mavjud bo'lsa ham.
+    MUHIM: littlefs'da os.rename mavjud faylni bosib yozadi, lekin FAT bilan
+    formatlangan qurilmada XATO beradi. Bunga tayanib qolsak, motosoat/holat
+    saqlash JIMGINA ishlamay qolishi mumkin edi."""
+    try:
+        os.rename(src, dst)
+        return
+    except OSError:
+        pass
+    try:
+        os.remove(dst)
+    except OSError:
+        pass
+    os.rename(src, dst)
+
+
 def _atomic_write(path, text):
     """Yozish yarmida quvvat uzilsa ham fayl buzilmasligi uchun."""
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(text)
-    os.rename(tmp, path)
+    _replace(tmp, path)
 
 
 def _read_float(path, default):
@@ -480,7 +498,7 @@ def check_for_update():
         print("[OTA] o'zgarish yo'q")
         return False
 
-    os.rename(tmp_path, "main.py")
+    _replace(tmp_path, "main.py")
     print("[OTA] yangi kod o'rnatildi, qayta yuklanmoqda...")
     time.sleep(1)
     machine.reset()
@@ -592,16 +610,39 @@ def uptime_s():
     return time.ticks_diff(time.ticks_ms(), _boot_ticks) // 1000
 
 
+def _next_boot_id():
+    """Har yoqilishda oshib boradigan raqam. Oflayn voqea QAYSI yoqilishda
+    yozilganini bilish uchun kerak: qurilma qayta yuklangan bo'lsa, 'necha
+    soniya oldin' hisobi ma'nosini yo'qotadi (uptime noldan boshlanadi)."""
+    try:
+        with open(BOOT_ID_FILE) as f:
+            n = int(f.read().strip())
+    except (OSError, ValueError):
+        n = 0
+    n = (n + 1) % 1000000
+    try:
+        _atomic_write(BOOT_ID_FILE, str(n))
+    except Exception:
+        pass
+    return n
+
+
+BOOT_ID = _next_boot_id()
+
+
 def queue_event(event_type, motosoat):
     # Agar NTP hali sozlanmagan bo'lsa (internetsiz yonganda), haqiqiy sana
     # ma'lum emas. Bunday paytda vaqt o'rniga MANFIY "uptime belgisi" yoziladi.
     # Yuborish paytida (vaqt allaqachon sozlangan bo'ladi) u haqiqiy sanaga
     # aylantiriladi - shunday qilib oflayn voqealar ham to'g'ri vaqtga tushadi.
     if time_is_valid():
-        ts = int(time.time() + UNIX_EPOCH_OFFSET)
+        line = "EVENT|{}|{}|{:.4f}".format(
+            int(time.time() + UNIX_EPOCH_OFFSET), event_type, motosoat)
     else:
-        ts = -uptime_s()
-    line = "EVENT|{}|{}|{:.4f}".format(ts, event_type, motosoat)
+        # 5-maydon: yoqilish raqami. Yuborishda shu raqam joriy yoqilishga
+        # mos kelsa, aniq vaqt hisoblanadi; mos kelmasa (orada qayta yuklangan)
+        # aniq vaqtni bilib bo'lmaydi - internet qaytgan payt taxminan olinadi.
+        line = "EVENT|{}|{}|{:.4f}|{}".format(-uptime_s(), event_type, motosoat, BOOT_ID)
     try:
         if _queue_line_count() >= EVENTS_QUEUE_MAX_LINES:
             print("[EVENT] navbat to'ldi, eng eskilari tashlab yuborildi")
@@ -625,7 +666,7 @@ def _trim_queue(keep_last):
                 if i >= skip:
                     dst.write(line)
                 i += 1
-        os.rename(tmp, EVENTS_QUEUE_FILE)
+        _replace(tmp, EVENTS_QUEUE_FILE)
     except Exception:
         pass
 
@@ -642,12 +683,25 @@ def _resolve_event_time(line):
         return line
     if not time_is_valid():
         return None          # hali aniqlab bo'lmaydi
-    age = uptime_s() + ts    # ts manfiy: yozilganidan beri o'tgan soniyalar
-    if age < 0:
+
+    same_boot = False
+    if len(parts) >= 5:
+        try:
+            same_boot = (int(parts[4]) == BOOT_ID)
+        except Exception:
+            same_boot = False
+
+    if same_boot:
+        age = uptime_s() + ts        # ts manfiy: yozilganidan beri o'tgan vaqt
+        if age < 0:
+            age = 0
+    else:
+        # Orada qayta yuklangan: qurilmada soat yo'q, u o'chiq turgan vaqtni
+        # bilolmaydi. Eng halol taxmin - "aloqa tiklangan payt".
         age = 0
-    real_ts = int(time.time() + UNIX_EPOCH_OFFSET) - age
-    parts[1] = str(real_ts)
-    return "|".join(parts)
+
+    parts[1] = str(int(time.time() + UNIX_EPOCH_OFFSET) - age)
+    return "|".join(parts[:4])       # 5-maydon (yoqilish raqami) yuborilmaydi
 
 
 def flush_event_queue(client):
@@ -687,7 +741,7 @@ def flush_event_queue(client):
                     client = mqtt_close(client)
                     failed = True
                     dst.write(line + "\n")
-        os.rename(tmp, EVENTS_QUEUE_FILE)
+        _replace(tmp, EVENTS_QUEUE_FILE)
         if not failed:
             try:
                 os.remove(EVENTS_QUEUE_FILE)
@@ -801,22 +855,20 @@ def main():
     wdt = WDT(timeout=WDT_TIMEOUT_MS)
     print("[BOOT] WDT yoqildi ({} ms)".format(WDT_TIMEOUT_MS))
 
-    # WiFi: ulanmasa ham ABADIY kutmaydi - qayta urinib turadi, orada
-    # serial buyruqlarni qabul qiladi (WiFi'ni qayta sozlash mumkin)
-    while not wifi_is_up():
-        try:
-            connect_wifi()
-        except Exception as e:
-            print("[WIFI] xato:", e, "-", WIFI_RETRY_INTERVAL_S, "soniyada qayta urinadi")
-            t0 = time.time()
-            while time.time() - t0 < WIFI_RETRY_INTERVAL_S:
-                feed_wdt()
-                check_serial_commands()
-                time.sleep(0.1)
+    # WiFi'ga bir marta urinamiz, LEKIN ulanmasa ham monitoring boshlanadi.
+    # MUHIM: eski kod WiFi ulanmaguncha kutib turardi - ya'ni zavodda internet
+    # butunlay yo'q bo'lsa, motosoat UMUMAN sanalmasdi va ON/OFF voqealari
+    # yozilmasdi. Holbuki oflayn hisoblash tizimning asosiy vazifasi.
+    # Endi tarmoq bo'lmasa ham o'lchash ishlaydi, WiFi fonda tiklanadi.
+    try:
+        connect_wifi()
+    except Exception as e:
+        print("[WIFI] boshlang'ich ulanish bo'lmadi:", e, "- OFLAYN davom etadi")
 
-    # NTP HAR DOIM chaqiriladi (WiFi allaqachon ulangan holatda ham) - aks holda
-    # vaqt 2000-yilda qolib, barcha voqealar 26 yil xato sana bilan yoziladi.
-    sync_time()
+    # NTP: vaqt sozlanmasa voqealar noto'g'ri sanaga tushadi. Ulanmasa,
+    # tsikl ichida qayta urinib turiladi.
+    if wifi_is_up():
+        sync_time()
 
     motohours = load_motohours()
     last_status = load_last_status()   # reboot'dan keyin soxta voqea yozilmaydi
