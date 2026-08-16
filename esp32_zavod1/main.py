@@ -30,6 +30,7 @@ DEVICE = "zavod1"
 WIFI_CONFIG_FILE = "wifi_config.json"
 MQTT_CONFIG_FILE = "mqtt_config.json"   # faqat qurilmada, GitHub'ga hech qachon ketmaydi
 MOTOHOURS_FILE = "motohours.txt"
+MOTOHOURS_BAK_FILE = "motohours.bak"    # ikkinchi nusxa - biri buzilsa yo'qolmasin
 EVENTS_QUEUE_FILE = "events_queue.txt"  # internet yo'q paytda ON/OFF voqealari
 THRESHOLD_FILE = "threshold.txt"
 STATUS_FILE = "last_status.txt"         # reboot'dan keyin soxta voqea yozilmasligi uchun
@@ -220,11 +221,37 @@ def save_threshold(value):
 
 
 def load_motohours():
-    return _read_float(MOTOHOURS_FILE, 0.0)
+    """Motosoat IKKI nusxada saqlanadi. Bittasi buzilsa (quvvat yozish paytida
+    uzilsa, flesh eskirsa) ikkinchisi qoladi. Motosoat faqat o'sadi, shuning
+    uchun ikkalasidan KATTASI olinadi - hech qachon nolga tushib ketmaydi.
+    Bir nusxada bu xato butun ish tarixini yo'qotardi."""
+    a = _read_float(MOTOHOURS_FILE, -1.0)
+    b = _read_float(MOTOHOURS_BAK_FILE, -1.0)
+    best = max(a, b)
+    if best < 0:
+        return 0.0
+    if a != b:
+        # O'Z-O'ZINI TIKLASH: bitta nusxa buzilgan/eskirgan bo'lsa, darhol
+        # ikkalasi ham to'g'ri qiymat bilan qayta yoziladi. Busiz buzilishlar
+        # to'planib borar va oxiri IKKALA nusxa ham yo'qolib, butun ish
+        # tarixi nolga tushib ketardi.
+        print("[MOTOSOAT] nusxalar farq qildi (a={}, b={}) - {} tiklandi".format(a, b, best))
+        save_motohours(best)
+    return best
 
 
 def save_motohours(hours):
-    _atomic_write(MOTOHOURS_FILE, "{:.6f}".format(hours))
+    """Ikkala nusxaga ham yozadi. Disk to'lgan/nosoz bo'lsa QULAMAYDI -
+    o'lchash davom etadi, faqat saqlash keyinga qoladi."""
+    txt = "{:.6f}".format(hours)
+    ok = False
+    for path in (MOTOHOURS_FILE, MOTOHOURS_BAK_FILE):
+        try:
+            _atomic_write(path, txt)
+            ok = True
+        except Exception as e:
+            print("[MOTOSOAT] saqlashda xato ({}): {}".format(path, e))
+    return ok
 
 
 def load_last_status():
@@ -1090,8 +1117,8 @@ def main():
                 # Sikl tugagan payt - motosoatni darhol saqlash (quvvat shu
                 # zahoti uzilsa ham oxirgi ish vaqti yo'qolmasin)
                 if abs(motohours - saved_motohours) > 1e-6:
-                    save_motohours(motohours)
-                    saved_motohours = motohours
+                    if save_motohours(motohours):
+                        saved_motohours = motohours
                 client = flush_event_queue(client)
 
             # --- MQTT'ga yuborish ---
@@ -1111,8 +1138,8 @@ def main():
             if now - last_save >= MOTOHOURS_SAVE_INTERVAL_S:
                 last_save = now
                 if abs(motohours - saved_motohours) > 1e-6:
-                    save_motohours(motohours)
-                    saved_motohours = motohours
+                    if save_motohours(motohours):
+                        saved_motohours = motohours
                 client = flush_event_queue(client)
 
             # --- OTA (kuniga bir marta) ---
