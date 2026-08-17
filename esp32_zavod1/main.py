@@ -105,6 +105,11 @@ def _install_socket_timeout(mod):
     """Modul ichidagi socket yaratuvchini timeout qo'yadigan variantga almashtiradi."""
     if getattr(mod, "_timeout_patched", False):
         return
+    # Ba'zi MicroPython versiyalarida "usocket" moduli mavjud, LEKIN ichida
+    # socket() yo'q (eskirgan bo'sh modul). Buni tekshirmasak, dastur shu
+    # yerda qulab, qurilma umuman ishga tushmaydi.
+    if not hasattr(mod, "socket"):
+        return
     orig = mod.socket
 
     def _patched(*args, **kwargs):
@@ -123,24 +128,44 @@ def _install_socket_timeout(mod):
 # qilishi mumkin. Ba'zi MicroPython versiyalarida bular AYRIM modul obyektlari -
 # faqat bittasini tuzatsak, ikkinchisi himoyasiz qoladi (aynan MQTT qotib
 # qolardi). Shu sabab ikkalasi ham tuzatiladi.
-_install_socket_timeout(socket)
+# DIQQAT (haqiqiy qurilmada aniqlangan): ESP32'dagi MicroPython'da "socket"
+# moduli C tilida yozilgan va uning ichiga YANGI QIYMAT YOZIB BO'LMAYDI.
+# Ya'ni quyidagi usul faqat ba'zi platformalarda ishlaydi, ESP32'da esa yo'q.
+# Shu sabab asosiy himoya boshqa joyda: mqtt_connect() ulanish uchun aniq
+# vaqt chegarasi beradi va restore_socket_timeout() har amaldan keyin uni
+# tiklaydi - bular socket OBYEKTI ustida ishlaydi va har doim kuchga ega.
+try:
+    _install_socket_timeout(socket)
+except Exception:
+    pass
 try:
     import usocket as _usocket
     if _usocket is not socket:
         _install_socket_timeout(_usocket)
-except ImportError:
+except Exception:
     pass
+
+
+_timeout_warned = False
 
 
 def restore_socket_timeout(client):
     """check_msg()/wait_msg() setblocking(True) qilib timeout'ni o'chiradi -
-    har safar qayta tiklanadi, aks holda publish() abadiy qotib qolishi mumkin."""
+    har safar qayta tiklanadi, aks holda publish() abadiy qotib qolishi mumkin.
+    Bu QOTIB QOLISHGA QARSHI ASOSIY HIMOYA - ishlamay qolsa, bilib turishimiz
+    kerak, shuning uchun bir marta ogohlantirish chiqaradi."""
+    global _timeout_warned
     if client is None:
-        return
+        return True
     try:
         client.sock.settimeout(SOCKET_TIMEOUT_S)
-    except Exception:
-        pass
+        return True
+    except Exception as e:
+        if not _timeout_warned:
+            _timeout_warned = True
+            print("[NET] OGOHLANTIRISH: ulanishga vaqt chegarasi qo'yib bo'lmadi:", e)
+            print("[NET] qotib qolishdan himoya faqat WDT'ga tayanadi")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +753,14 @@ def mqtt_connect():
         ssl_params={"server_hostname": MQTT_BROKER, "cert_reqs": ssl.CERT_NONE},
     )
     client.set_callback(mqtt_message_callback)
-    client.connect()
+    # Ulanish (TCP + SSL) bosqichiga aniq vaqt chegarasi. Yangi umqtt
+    # kutubxonalari buni qo'llab-quvvatlaydi; eskilarida bu parametr yo'q,
+    # shuning uchun xatoga tushsa oddiy usulda ulanadi.
+    try:
+        client.connect(timeout=SOCKET_TIMEOUT_S)
+    except TypeError:
+        client.connect()
+    restore_socket_timeout(client)      # o'rnatilgan ulanishga chegara qo'yiladi
     client.subscribe(MQTT_COMMAND_TOPIC)
     restore_socket_timeout(client)
     print("[MQTT] ulandi:", MQTT_BROKER)

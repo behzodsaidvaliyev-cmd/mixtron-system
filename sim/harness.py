@@ -250,15 +250,28 @@ class FakeSock:
         return len(d)
 
 
+class _ReadOnlyModule(types.ModuleType):
+    """ESP32'dagi C modullar kabi: yangi xossa yozib bo'lmaydi."""
+    def __setattr__(self, name, value):
+        if name.startswith("__") or not getattr(self, "_frozen", False):
+            return object.__setattr__(self, name, value)
+        raise AttributeError("'module' object has no attribute '{}'".format(name))
+
+
 def _install_socket():
-    m = types.ModuleType("socket")
+    m = _ReadOnlyModule("socket")
     m.socket = FakeSock
     m.getaddrinfo = lambda h, p: [(2, 1, 0, "", (h, p))]
     m.AF_INET = 2
     m.SOCK_STREAM = 1
     m.SOCK_DGRAM = 2
+    object.__setattr__(m, "_frozen", True)   # endi yozishga yopiq
     sys.modules["socket"] = m
-    sys.modules["usocket"] = m          # bir xil modul obyekti
+    # HAQIQIY ESP32 (MicroPython 1.28) da "usocket" ALOHIDA modul bo'lib,
+    # ichida socket() YO'Q. Avval simulyator uni bir xil obyekt qilib qo'ygani
+    # uchun shu holat sinalmay qolgan va qurilmada dastur qulagan edi.
+    stub = types.ModuleType("usocket")
+    sys.modules["usocket"] = stub
     return m
 
 
