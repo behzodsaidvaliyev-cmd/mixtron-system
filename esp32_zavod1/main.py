@@ -65,6 +65,16 @@ BOOT_SAFE_WINDOW_S = 5          # WDT yoqilishidan oldingi "qutqaruv oynasi"
 EVENTS_QUEUE_MAX_LINES = 500    # navbat cheksiz o'smasligi uchun chegara
 PRINT_DATA_LINES = True         # serial'ga har o'qishni chop etish (nosozlik izlashda qulay)
 
+# --- HOLAT CHIROG'I ---
+# Qutini ochmasdan, noutbuksiz turib qurilma holatini bilish uchun.
+# GPIO2 - ko'p ESP32 DevKit platalarida O'RNATILGAN ko'k chiroq (qo'shimcha
+# sim kerak emas). Tashqi chiroq qo'ysangiz: GPIO -> 330 Om -> LED -> GND.
+LED_ENABLED = True
+LED_PIN = 2
+LED_ACTIVE_HIGH = True          # ba'zi platalarda chiroq teskari ulangan: False qiling
+LED_CYCLE_MS = 3000             # naqsh takrorlanish davri
+LED_BLINK_MS = 300              # bitta miltillash uchun ajratilgan vaqt
+
 OTA_ENABLED = True
 OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32_zavod1/main.py"
 OTA_CHECK_INTERVAL_S = 86400    # kuniga bir marta
@@ -296,6 +306,51 @@ wdt = None  # main() ichida yoqiladi
 def feed_wdt():
     if wdt is not None:
         wdt.feed()
+
+
+# ---------------------------------------------------------------------------
+# HOLAT CHIROG'I
+# ---------------------------------------------------------------------------
+# Miltillash naqshi (har 3 soniyada takrorlanadi):
+#   1 marta  - HAMMASI JOYIDA (WiFi + server + datchik ishlayapti)
+#   2 marta  - WiFi yo'q
+#   3 marta  - WiFi bor, lekin serverga ulanmadi
+#   4 marta  - datchik (PZEM) javob bermayapti
+#   uzluksiz yonib turibdi - qurilma endi yonmoqda (yoki xavfsiz rejimda)
+
+LED_OK = 1
+LED_NO_WIFI = 2
+LED_NO_SERVER = 3
+LED_NO_SENSOR = 4
+
+_led = None
+if LED_ENABLED:
+    try:
+        _led = Pin(LED_PIN, Pin.OUT)
+    except Exception as e:
+        print("[LED] chiroqni sozlab bo'lmadi:", e)
+
+
+def led_set(on):
+    if _led is None:
+        return
+    try:
+        _led.value(1 if (on == LED_ACTIVE_HIGH) else 0)
+    except Exception:
+        pass
+
+
+def led_update(blinks):
+    """Tsikldan chaqiriladi. Kutmaydi (bloklamaydi) - shunchaki hozirgi
+    vaqtga qarab chiroqni yoqadi/o'chiradi."""
+    if _led is None:
+        return
+    phase = time.ticks_ms() % LED_CYCLE_MS
+    span = blinks * LED_BLINK_MS
+    if phase < span:
+        led_set((phase % LED_BLINK_MS) < (LED_BLINK_MS // 2))
+    else:
+        led_set(False)
 
 
 def connect_wifi(timeout_s=WIFI_CONNECT_TIMEOUT_S):
@@ -966,14 +1021,16 @@ def check_serial_commands():
 
 def boot_safe_window():
     print("[BOOT] {} soniya qutqaruv oynasi - to'xtatish uchun 'SAFE' yozing".format(BOOT_SAFE_WINDOW_S))
+    led_set(True)          # yonish paytida chiroq uzluksiz yonadi
     t0 = time.time()
     while time.time() - t0 < BOOT_SAFE_WINDOW_S:
         if _poller.poll(0):
             line = sys.stdin.readline()
             if line and line.strip().upper() == "SAFE":
                 print("[BOOT] XAVFSIZ REJIM - dastur to'xtatildi, REPL ochiq")
-                return False
+                return False        # chiroq yonib qoladi = xavfsiz rejim belgisi
         time.sleep(0.1)
+    led_set(False)
     return True
 
 
@@ -1036,6 +1093,16 @@ def main():
         feed_wdt()
         check_serial_commands()
         now = time.time()
+
+        # --- Holat chirog'i ---
+        if not wifi_is_up():
+            led_update(LED_NO_WIFI)
+        elif client is None:
+            led_update(LED_NO_SERVER)
+        elif pzem_fail_count > 0:
+            led_update(LED_NO_SENSOR)
+        else:
+            led_update(LED_OK)
 
         # --- Yangi OTA kodi yetarli vaqt ishladi -> "barqaror" deb belgilanadi ---
         if boot_mono is not None and uptime_s() - boot_mono >= OTA_STABLE_AFTER_S:

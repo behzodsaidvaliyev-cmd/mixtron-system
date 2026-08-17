@@ -50,6 +50,8 @@ class World:
         self.wifi_connects = 0
         self.uart_reinits = 0
         self.flash_writes = 0
+        self.led_writes = 0
+        self.led_state = 0
 
     def advance(self, sec):
         self.clock += sec
@@ -148,10 +150,27 @@ class FakeWDT:
         W.feed()
 
 
+class FakePin:
+    OUT = 3
+    IN = 1
+
+    def __init__(self, pin, mode=None, *a, **kw):
+        self.pin = pin
+        self._v = 0
+
+    def value(self, v=None):
+        if v is None:
+            return self._v
+        self._v = v
+        W.led_writes += 1
+        W.led_state = v
+        return None
+
+
 def _install_machine():
     m = types.ModuleType("machine")
     m.UART = FakeUART
-    m.Pin = lambda *a, **kw: None
+    m.Pin = FakePin
     m.WDT = FakeWDT
     m.unique_id = lambda: b"\xaa\xbb\xcc\xdd\xee\xff"
     m.reset = lambda: (_ for _ in ()).throw(DeviceReset("machine.reset()"))
