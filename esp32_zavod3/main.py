@@ -626,11 +626,16 @@ def check_for_update():
         # Server aytgan hajm - yuklab olingan hajm bilan solishtiriladi.
         # Matnli faylda oxirgi qatordan to'liqlikni bilardik; ikkilik .mpy'da
         # bunday belgi yo'q, shuning uchun hajm yagona ishonchli o'lchov.
+        # Sarlavha nomlari turli registrda kelishi mumkin, kalitlar esa str
+        # yoki bytes bo'lishi mumkin - shuning uchun hammasi bir xilga
+        # keltirilib solishtiriladi (qurilmada tekshirilgan).
         try:
             h = getattr(r, "headers", None) or {}
-            for k in (b"Content-Length", "Content-Length", b"content-length", "content-length"):
-                if k in h:
-                    expected = int(h[k])
+            for k in h:
+                ks = k.decode() if isinstance(k, bytes) else str(k)
+                if ks.lower() == "content-length":
+                    v = h[k]
+                    expected = int(v.decode() if isinstance(v, bytes) else v)
                     break
         except Exception:
             expected = 0
@@ -668,10 +673,14 @@ def check_for_update():
                 head = f.read(2)
             size = os.stat(tmp_path)[6]
             valid = (len(head) == 2 and head[0] == 0x4D and size == total)
-            if valid and expected > 0:
-                valid = (total == expected)
+            if valid and expected <= 0:
+                # Hajmni bilmasak, yarim yuklangan faylni to'liqdan ajrata
+                # olmaymiz. Bunday holatda YANGILAMAYMIZ - ishlab turgan
+                # qurilmani buzgandan ko'ra eski kod bilan qolgan yaxshi.
+                print("[OTA] server fayl hajmini aytmadi - yangilash bekor qilindi")
+                valid = False
             elif valid:
-                print("[OTA] server hajmni aytmadi - faqat sehrli belgi tekshirildi")
+                valid = (total == expected)
         except Exception:
             valid = False
 
