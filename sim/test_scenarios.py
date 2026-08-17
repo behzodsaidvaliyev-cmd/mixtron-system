@@ -11,7 +11,11 @@ import tempfile
 import importlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FIRMWARE = os.path.abspath(os.path.join(HERE, "..", "main.py"))
+# Sinaladigan kod: repo ichida esp32_zavod3/main.py, ishchi papkada esa
+# yonidagi main.py. Ikkala joyda ham ishlashi uchun avtomatik tanlanadi.
+FIRMWARE = os.path.abspath(os.path.join(HERE, "..", "esp32_zavod3", "main.py"))
+if not os.path.exists(FIRMWARE):
+    FIRMWARE = os.path.abspath(os.path.join(HERE, "..", "main.py"))
 
 sys.path.insert(0, HERE)
 import harness
@@ -246,15 +250,16 @@ def run_all():
     W.__init__()
     new_device(tmp)
     good = open(os.path.join(tmp, "main.py"), encoding="utf-8").read()
-    # "Eski, ishlaydigan" versiya zaxirada; main.py esa "yangi nosoz" kod
-    with open(os.path.join(tmp, "main_prev.py"), "w", encoding="utf-8") as f:
+    # OTA endi app.mpy ni yangilaydi (main.py - himoyali yo'llovchi).
+    # "Eski, ishlaydigan" versiya zaxirada; app.mpy esa "yangi nosoz" kod
+    with open(os.path.join(tmp, "app_prev.mpy"), "w", encoding="utf-8") as f:
         f.write(good)
     with open(os.path.join(tmp, "ota_pending.txt"), "w") as f:
         f.write("2")                    # imkoniyatlar tugagan -> rollback bo'lishi shart
-    with open(os.path.join(tmp, "main.py"), "a", encoding="utf-8") as f:
+    with open(os.path.join(tmp, "app.mpy"), "a", encoding="utf-8") as f:
         f.write("\n# YANGI NOSOZ VERSIYA BELGISI\n")
     out = boot(30)
-    restored = open(os.path.join(tmp, "main.py"), encoding="utf-8").read()
+    restored = open(os.path.join(tmp, "app.mpy"), encoding="utf-8").read()
     check("nosoz yangilanish o'rniga eski versiya tiklandi",
           "YANGI NOSOZ VERSIYA BELGISI" not in restored, out)
     check("'tasdiqlanmagan' belgisi tozalandi",
@@ -263,14 +268,14 @@ def run_all():
     print("\n=== 12. Yangi OTA kodiga ishlash imkoni beriladi (darrov qaytarilmaydi) ===")
     W.__init__()
     new_device(tmp)
-    with open(os.path.join(tmp, "main_prev.py"), "w", encoding="utf-8") as f:
+    with open(os.path.join(tmp, "app_prev.mpy"), "w", encoding="utf-8") as f:
         f.write(good)
     with open(os.path.join(tmp, "ota_pending.txt"), "w") as f:
         f.write("0")                    # OTA endigina o'rnatdi: 0-urinish
-    with open(os.path.join(tmp, "main.py"), "a", encoding="utf-8") as f:
+    with open(os.path.join(tmp, "app.mpy"), "a", encoding="utf-8") as f:
         f.write("\n# YANGI VERSIYA BELGISI\n")
     out = boot(60)                      # qisqa: hali barqaror deb tasdiqlanmaydi
-    still_new = "YANGI VERSIYA BELGISI" in open(os.path.join(tmp, "main.py"), encoding="utf-8").read()
+    still_new = "YANGI VERSIYA BELGISI" in open(os.path.join(tmp, "app.mpy"), encoding="utf-8").read()
     check("birinchi yoqilishda ORQAGA QAYTARILMADI", still_new, out)
     attempts = open(os.path.join(tmp, "ota_pending.txt")).read().strip() \
         if os.path.exists(os.path.join(tmp, "ota_pending.txt")) else "yo'q"
@@ -281,6 +286,20 @@ def run_all():
     out = boot(400)                     # OTA_STABLE_AFTER_S = 180
     check("belgi olib tashlandi (rollback endi bo'lmaydi)",
           not os.path.exists(os.path.join(tmp, "ota_pending.txt")), out)
+
+    print("\n=== 12c. NTP 136 yil xato vaqt bersa RAD ETILADI (2036 aylanishi) ===")
+    W.__init__()
+    new_device(tmp)
+    W.ntp_bad = True
+    out = boot(40)
+    # boot() faqat yakun so'zini qaytaradi, chiqish matnini emas - shuning
+    # uchun NTP rad etilgani SOAT TIKLANGANIDAN bilinadi (keyingi tekshiruv).
+    check("NTP rad etilgach ham ishlashda davom etdi", len(W.published) > 0, out)
+    check("soat 2036 ga sakrab ketmadi", W.clock < 1000000000.0,
+          "soat={}".format(W.clock))
+    bad = [pl for _t, pl in W.published if pl.startswith("EVENT|") and
+           int(pl.split("|")[1]) > 2250000000]
+    check("xato sanali voqea yuborilmadi", not bad, bad[:2])
 
     print("\n=== 13. Yoqilish xabari Railway'ga ketyaptimi ===")
     W.__init__()

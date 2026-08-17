@@ -53,6 +53,12 @@ WIFI_RETRY_INTERVAL_S = 20      # ulanmasa, shuncha soniyada qayta urinadi
 WIFI_HEALTH_INTERVAL_S = 30     # ish paytida WiFi uzilmaganini tekshirish oralig'i
 NTP_RETRY_INTERVAL_S = 60       # vaqt sozlanmagan bo'lsa, qayta urinish oralig'i
 MAX_SANE_DT_S = 300             # bundan katta vaqt farqi = soat sakragan, hisobga olinmaydi
+# NTP protokoli 2036-02-07 da "aylanadi" va ba'zi javoblar 136 yil noto'g'ri
+# vaqt beradi. Bu faraz emas: zavod1 ma'lumotlarida aynan 2036-02-07 sanali
+# yozuv topilgan. Bunday vaqt qabul qilinsa, hisobotlar butunlay buziladi.
+MIN_VALID_TIME_S = 1785000000   # ~2026-07: bundan oldingi vaqt = xato
+MAX_VALID_TIME_S = 2082758400   # 2036-01-01: NTP aylanishi 2036-02-07 da
+                                # bo'ladi, shuning uchun chegara undan OLDIN
 
 PZEM_SLAVE_ADDR = 0xF8
 PZEM_DEBUG = False              # True qilinsa xom baytlarni chop etadi (nosozlik izlashda)
@@ -459,7 +465,21 @@ def sync_time():
     global time_synced
     try:
         import ntptime
+        from machine import RTC
+        rtc = RTC()
+        before = rtc.datetime()          # xato vaqt kelsa qaytarish uchun
         ntptime.settime()
+        now_unix = time.time() + UNIX_EPOCH_OFFSET
+        if now_unix < MIN_VALID_TIME_S or now_unix > MAX_VALID_TIME_S:
+            # NTP ishonchsiz javob berdi (masalan 2036 aylanishi). Soatni
+            # eski holiga qaytaramiz: noto'g'ri vaqt bilan yozilgan voqealar
+            # hisobotni buzadi, vaqtsiz voqea esa keyinroq tiklanadi.
+            try:
+                rtc.datetime(before)
+            except Exception:
+                pass
+            print("[TIME] NTP ishonchsiz vaqt qaytardi - rad etildi:", time.localtime())
+            return False
         time_synced = True
         print("[TIME] NTP sozlandi (UTC):", time.localtime())
         return True

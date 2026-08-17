@@ -30,12 +30,13 @@ class World:
     """Simulyatsiya holati: soat, WiFi, broker, PZEM, WDT."""
 
     def __init__(self):
-        self.clock = 800000000.0      # MicroPython epoch (2000-dan), ~2025-yil
+        self.clock = 840300000.0      # MicroPython epoch (2000-dan), ~2026-avgust
         self.budget = None
         self.mono = 0.0
         self.wifi_up = True
         self.wifi_can_connect = True
         self.ntp_works = True
+        self.ntp_bad = False          # NTP 2036 aylanishi: 136 yil xato vaqt
         self.broker = "ok"            # ok | down | hang
         self.pzem = "ok"              # ok | dead
         self.pzem_current = 9.0
@@ -141,6 +142,16 @@ class FakeUART:
         W.uart_reinits += 1
 
 
+class FakeRTC:
+    """Soatni saqlash/tiklash. Firmware ishonchsiz NTP vaqtini rad etganda
+    eski vaqtni shu orqali qaytaradi."""
+
+    def datetime(self, dt=None):
+        if dt is None:
+            return ("soat", W.clock)
+        W.clock = dt[1]
+
+
 class FakeWDT:
     def __init__(self, timeout=0):
         W.wdt_timeout_s = timeout / 1000.0
@@ -172,6 +183,7 @@ def _install_machine():
     m.UART = FakeUART
     m.Pin = FakePin
     m.WDT = FakeWDT
+    m.RTC = FakeRTC
     m.unique_id = lambda: b"\xaa\xbb\xcc\xdd\xee\xff"
     m.reset = lambda: (_ for _ in ()).throw(DeviceReset("machine.reset()"))
     m.reset_cause = lambda: 1
@@ -283,18 +295,60 @@ def _install_ssl():
     return m
 
 
-class FakePoll:
-    def register(self, *a):
+class FakeSSLSock:
+    """HAQIQIY ESP32'dagi TLS soketi kabi: settimeout() YO'Q, setblocking() bor.
+    Aynan shu sabab eski himoya ishlamagan - simulyator buni sezmagani uchun
+    xato faqat qurilmada chiqqan edi."""
+
+    def __init__(self):
+        self.blocking = True
+
+    def setblocking(self, flag):
+        self.blocking = flag
+
+    def close(self):
         pass
 
-    def poll(self, *a):
-        return []                        # serial'dan hech narsa kelmayapti
+    def read(self, *a):
+        return b""
+
+    def write(self, d):
+        return len(d)
+
+
+class FakePoll:
+    """Soket tayyorligini brokerning holatiga qarab qaytaradi."""
+
+    def __init__(self):
+        self._reg = []
+
+    def register(self, obj, mask=1):
+        self._reg.append((obj, mask))
+
+    def unregister(self, obj):
+        self._reg = [(o, m) for o, m in self._reg if o is not obj]
+
+    def poll(self, timeout=-1):
+        out = []
+        for obj, mask in self._reg:
+            if isinstance(obj, FakeSSLSock) and (mask & 4):
+                if W.broker == "ok":
+                    out.append((obj, 4))          # POLLOUT - yozish mumkin
+                elif W.broker == "down":
+                    out.append((obj, 8))          # POLLERR - ulanish singan
+                # "hang" -> hech narsa: soket hech qachon tayyor bo'lmaydi
+        if not out and timeout and timeout > 0:
+            W.advance(timeout / 1000.0)           # kutish ham vaqt oladi
+        return out
 
 
 def _install_select():
     m = types.ModuleType("select")
     m.poll = FakePoll
     m.POLLIN = 1
+    m.POLLOUT = 4
+    m.POLLERR = 8
+    m.POLLHUP = 16
     sys.modules["select"] = m
     return m
 
@@ -306,8 +360,12 @@ def _install_ntptime():
         if not (W.wifi_up and W.ntp_works):
             raise OSError("NTP yetib bo'lmadi")
         W.advance(0.3)
-        if W.clock < 789000000:
-            W.clock = 800000000.0        # 2000 -> haqiqiy vaqtga sakrash
+        if W.ntp_bad:
+            # NTP 2036-02-07 da aylanadi: server 136 yil xato vaqt beradi
+            W.clock = 1138320000.0
+            return
+        if W.clock < 830000000:
+            W.clock = 840300000.0        # 2000 -> haqiqiy vaqtga sakrash
     m.settime = settime
     sys.modules["ntptime"] = m
     return m
@@ -315,7 +373,7 @@ def _install_ntptime():
 
 class FakeMQTTClient:
     def __init__(self, **kw):
-        self.sock = FakeSock()
+        self.sock = FakeSSLSock()
         self.cb = None
 
     def set_callback(self, cb):
@@ -333,8 +391,7 @@ class FakeMQTTClient:
             raise OSError("ETIMEDOUT")
         W.advance(1.2)                   # SSL handshake
         W.mqtt_connects += 1
-        self.sock = FakeSock()
-        self.sock.settimeout(15)
+        self.sock = FakeSSLSock()
 
     def disconnect(self):
         pass
@@ -348,11 +405,10 @@ class FakeMQTTClient:
         if W.broker == "down":
             raise OSError("ulanish yo'q")
         if W.broker == "hang":
-            # Timeout BO'LMASA bu abadiy qotib qolardi. Timeout bor bo'lsa
-            # 15 soniyada xato qaytaradi.
-            if self.sock.timeout is None:
-                W.advance(10000.0)       # ABADIY QOTISH (WDT ishga tushadi)
-            W.advance(self.sock.timeout)
+            # TLS soketiga timeout QO'YIB BO'LMAYDI - bu yergacha yetib kelish
+            # abadiy qotishni anglatadi. Dastur bu yerga umuman kelmasligi
+            # kerak: net_write_ready() oldindan to'xtatishi shart.
+            W.advance(10000.0)           # ABADIY QOTISH (WDT ishga tushadi)
             raise OSError("ETIMEDOUT")
         W.advance(0.05)
         t = topic.decode() if isinstance(topic, bytes) else topic

@@ -131,9 +131,19 @@ def on_message(client, userdata, msg):
             # Qurilma vaqtni aniqlay olmagan bo'lsa (NTP bloklangan tarmoq)
             # 0 yuboradi - bunda serverning O'Z soati ishlatiladi, aks holda
             # voqea 1970-yil sanasi bilan yozilib, hisobotlarni buzardi.
+            #
+            # Ishonchsiz KELAJAK sanasi ham shu yerda ushlanadi: NTP protokoli
+            # 2036-02-07 da "aylanadi" va ba'zi javoblar 136 yil noto'g'ri vaqt
+            # beradi. Bazada aynan shunday yozuv topilgan (zavod1, 2036-02-07).
+            # Qurilmada ham himoya bor, lekin eski kodli qurilma ulanib qolsa
+            # server oxirgi to'siq bo'lib turadi.
+            now = int(time.time())
             if event_ts <= 0:
-                event_ts = int(time.time())
+                event_ts = now
                 print("[EVENT] qurilmada vaqt yo'q edi - server vaqti qo'yildi")
+            elif event_ts > now + 86400 or event_ts < 1700000000:
+                print("[EVENT] ishonchsiz sana", event_ts, "- server vaqti qo'yildi")
+                event_ts = now
             event_time_local = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(event_ts + UZ_OFFSET))
             with db_lock:
                 conn.execute(

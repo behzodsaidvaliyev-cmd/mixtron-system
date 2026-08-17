@@ -13,7 +13,7 @@ o'lchandi: 59 KB yo'qolardi va TLS (MQTT) uchun yaxlit bo'lak qolmasdi -
 tizim xotirasidan deyarli hech narsa olmaydi.
 
 Qurilmaga yuklanadi:
-    main.py   <- ikki qatorlik yo'llovchi (device_main.py)
+    main.py   <- device_main.py (himoyali yo'llovchi)
     app.mpy   <- asosiy kod
 
 Ishlatilishi:  python build_all.py
@@ -25,7 +25,6 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))       # .../mixtron-system/tools
 REPO = os.path.dirname(ROOT)                            # .../mixtron-system
-STUB = "import app\napp.run()\n"
 
 
 def build_one(zavod):
@@ -40,10 +39,9 @@ def build_one(zavod):
 
 
 def main():
-    stub_path = os.path.join(REPO, "device_main.py")
-    with io.open(stub_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(STUB)
-    print("yo'llovchi:", stub_path)
+    # device_main.py qo'lda yoziladi - unda app.mpy buzilgan holat uchun
+    # himoya mantig'i bor, shuning uchun bu skript unga TEGMAYDI.
+    print("yo'llovchi: device_main.py (o'zgarmaydi)")
 
     for z in ("zavod1", "zavod2", "zavod3"):
         print(z + ":")

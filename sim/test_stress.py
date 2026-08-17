@@ -17,7 +17,11 @@ import random
 import builtins
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FIRMWARE = os.path.abspath(os.path.join(HERE, "..", "main.py"))
+# Sinaladigan kod: repo ichida esp32_zavod3/main.py, ishchi papkada esa
+# yonidagi main.py. Ikkala joyda ham ishlashi uchun avtomatik tanlanadi.
+FIRMWARE = os.path.abspath(os.path.join(HERE, "..", "esp32_zavod3", "main.py"))
+if not os.path.exists(FIRMWARE):
+    FIRMWARE = os.path.abspath(os.path.join(HERE, "..", "main.py"))
 sys.path.insert(0, HERE)
 
 import harness
