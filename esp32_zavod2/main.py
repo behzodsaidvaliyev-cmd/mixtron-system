@@ -59,6 +59,7 @@ PZEM_DEBUG = False              # True qilinsa xom baytlarni chop etadi (nosozli
 PZEM_REINIT_AFTER_FAILS = 15    # ~30 soniya javobsizlikdan keyin UART qayta ishga tushadi
 
 SOCKET_TIMEOUT_S = 15           # HECH QANDAY tarmoq amali bundan uzoq kutmaydi
+NET_WRITE_TIMEOUT_MS = 5000     # soket shuncha vaqtda yozishga tayyor bo'lmasa - o'lik
 WDT_TIMEOUT_MS = 120000         # asosiy tsikl shuncha qotib qolsa - majburiy reboot
 BOOT_SAFE_WINDOW_S = 5          # WDT yoqilishidan oldingi "qutqaruv oynasi"
 
@@ -76,10 +77,13 @@ LED_CYCLE_MS = 3000             # naqsh takrorlanish davri
 LED_BLINK_MS = 300              # bitta miltillash uchun ajratilgan vaqt
 
 OTA_ENABLED = True
-OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32_zavod2/main.py"
+OTA_URL = "https://raw.githubusercontent.com/behzodsaidvaliyev-cmd/mixtron-system/main/esp32_zavod2/app.mpy"
 OTA_CHECK_INTERVAL_S = 86400    # kuniga bir marta
-OTA_END_MARKER = "OTA-FAYL-OXIRI"  # fayl oxirida turadi; yuklash to'liqligini isbotlaydi
-OTA_PREV_FILE = "main_prev.py"     # OTA'dan oldingi ISHLAYDIGAN kod (orqaga qaytish uchun)
+APP_FILE = "app.mpy"               # asosiy kod - oldindan kompilyatsiya qilingan
+# NIMA UCHUN .mpy: ESP32 katta .py faylni O'ZI kompilyatsiya qilganda MicroPython
+# uyumi kengayadi va bu xotira TIZIMGA QAYTMAYDI. Natijada TLS uchun yaxlit
+# bo'lak qolmaydi va MQTT ulanmaydi (qurilmada o'lchangan: 59 KB yo'qotish).
+OTA_PREV_FILE = "app_prev.mpy"     # OTA'dan oldingi ISHLAYDIGAN kod (orqaga qaytish uchun)
 OTA_PENDING_FILE = "ota_pending.txt"  # yangi kod hali barqarorligi tasdiqlanmagan belgisi
 OTA_STABLE_AFTER_S = 180        # shuncha vaqt muammosiz ishlasa, yangi kod "yaxshi"
 OTA_MAX_BOOT_ATTEMPTS = 2       # yangi kodga shuncha yoqilish imkoni beriladi
@@ -98,8 +102,10 @@ UNIX_EPOCH_OFFSET = 946684800   # MicroPython 2000-yildan, Unix 1970-yildan sana
 # qayta yuklanish tsikli. Aynan shu sabab qurilmalar "o'lgan"dek ko'rinadi.
 #
 # Ikkinchi tuzoq: umqtt'ning check_msg() ichida setblocking(True) chaqiriladi,
-# bu MicroPython'da timeout'ni BEKOR QILADI. Shu sabab timeout har bir
-# check_msg()'dan keyin qayta tiklanadi (restore_socket_timeout()).
+# bu MicroPython'da timeout'ni BEKOR QILADI. HAQIQIY QURILMADA ANIQLANDI:
+# ESP32'da TLS soketiga (SSLSocket) timeout'ni QAYTA QO'YIB HAM BO'LMAYDI -
+# unda settimeout() umuman yo'q. Shu sabab asosiy himoya net_write_ready():
+# har bir yuborishdan oldin poll() bilan soket tirikligi tekshiriladi.
 
 def _install_socket_timeout(mod):
     """Modul ichidagi socket yaratuvchini timeout qo'yadigan variantga almashtiradi."""
@@ -132,8 +138,9 @@ def _install_socket_timeout(mod):
 # moduli C tilida yozilgan va uning ichiga YANGI QIYMAT YOZIB BO'LMAYDI.
 # Ya'ni quyidagi usul faqat ba'zi platformalarda ishlaydi, ESP32'da esa yo'q.
 # Shu sabab asosiy himoya boshqa joyda: mqtt_connect() ulanish uchun aniq
-# vaqt chegarasi beradi va restore_socket_timeout() har amaldan keyin uni
-# tiklaydi - bular socket OBYEKTI ustida ishlaydi va har doim kuchga ega.
+# vaqt chegarasi beradi, har bir yuborishdan oldin esa net_write_ready()
+# poll() orqali soket rostdan yozishga tayyorligini tekshiradi. poll() TLS
+# soketida ham ishlaydi - bu qurilmada sinab ko'rilgan.
 try:
     _install_socket_timeout(socket)
 except Exception:
@@ -150,22 +157,50 @@ _timeout_warned = False
 
 
 def restore_socket_timeout(client):
-    """check_msg()/wait_msg() setblocking(True) qilib timeout'ni o'chiradi -
-    har safar qayta tiklanadi, aks holda publish() abadiy qotib qolishi mumkin.
-    Bu QOTIB QOLISHGA QARSHI ASOSIY HIMOYA - ishlamay qolsa, bilib turishimiz
-    kerak, shuning uchun bir marta ogohlantirish chiqaradi."""
+    """Soketga vaqt chegarasini qaytadan qo'yishga urinadi (qo'shimcha himoya).
+
+    Ba'zi platformalarda bu ishlaydi, ESP32'da esa TLS soketida settimeout()
+    umuman yo'q. Shu sabab bunga TAYANIB BO'LMAYDI - asosiy himoya
+    net_write_ready()."""
     global _timeout_warned
     if client is None:
         return True
     try:
         client.sock.settimeout(SOCKET_TIMEOUT_S)
         return True
-    except Exception as e:
+    except Exception:
         if not _timeout_warned:
             _timeout_warned = True
-            print("[NET] OGOHLANTIRISH: ulanishga vaqt chegarasi qo'yib bo'lmadi:", e)
-            print("[NET] qotib qolishdan himoya faqat WDT'ga tayanadi")
+            print("[NET] TLS soketida settimeout yo'q - himoya poll() orqali ishlaydi")
         return False
+
+
+def net_write_ready(client, timeout_ms=NET_WRITE_TIMEOUT_MS):
+    """QOTIB QOLISHGA QARSHI ASOSIY HIMOYA.
+
+    Har bir yuborishdan OLDIN soket rostdan yozishga tayyormi - poll() bilan
+    so'raladi. "Yarim ochiq" ulanishda (router qayta yuklangan, operator
+    aloqani uzgan) soket hech qachon tayyor bo'lmaydi: bu yerda eng ko'pi
+    timeout_ms kutamiz va ulanishni o'lik deb hisoblaymiz. Himoyasiz write()
+    esa ABADIY kutib qolardi - qurilmalar aynan shundan "o'lgan" edi.
+
+    poll() TLS soketida ishlashi haqiqiy qurilmada tekshirilgan."""
+    sock = getattr(client, "sock", None)
+    if sock is None:
+        return False
+    try:
+        p = select.poll()
+        p.register(sock, select.POLLOUT)
+        events = p.poll(timeout_ms)
+    except Exception:
+        return True                  # poll ishlamasa - ishni to'xtatmaymiz
+    bad = getattr(select, "POLLERR", 0) | getattr(select, "POLLHUP", 0)
+    for _s, ev in events:
+        if bad and (ev & bad):
+            return False
+        if ev & select.POLLOUT:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -578,15 +613,27 @@ def check_for_update():
         print("[OTA] urequests yo'q - mip.install('urequests')")
         return False
 
-    tmp_path = "ota_tmp.py"
+    tmp_path = "ota_tmp.mpy"
     gc.collect()
     r = None
     total = 0
+    expected = 0
     try:
         r = urequests.get(OTA_URL)
         if r.status_code != 200:
             print("[OTA] HTTP status:", r.status_code)
             return False
+        # Server aytgan hajm - yuklab olingan hajm bilan solishtiriladi.
+        # Matnli faylda oxirgi qatordan to'liqlikni bilardik; ikkilik .mpy'da
+        # bunday belgi yo'q, shuning uchun hajm yagona ishonchli o'lchov.
+        try:
+            h = getattr(r, "headers", None) or {}
+            for k in (b"Content-Length", "Content-Length", b"content-length", "content-length"):
+                if k in h:
+                    expected = int(h[k])
+                    break
+        except Exception:
+            expected = 0
         with open(tmp_path, "wb") as f:
             while True:
                 feed_wdt()
@@ -609,29 +656,34 @@ def check_for_update():
             pass
         gc.collect()
 
-    # Yaxlitlik tekshiruvi. Fayl OXIRIDAGI maxsus belgi tekshiriladi - agar
-    # yuklash yarmida uzilgan bo'lsa, bu belgi bo'lmaydi va main.py TEGILMAYDI.
-    # (Yarim fayl yozilsa qurilma butunlay ishlamay qolardi.)
+    # Yaxlitlik tekshiruvi. Yarim yuklangan fayl o'rnatilsa qurilma butunlay
+    # ishlamay qolardi, shuning uchun uch shart ham bajarilishi kerak:
+    #   1) fayl .mpy sehrli belgisi bilan boshlanadi ('M')
+    #   2) diskdagi hajm yuklab olingan hajmga teng (yozish to'liq tugagan)
+    #   3) server aytgan hajmga teng (oqim yarmida uzilmagan)
     valid = False
     if total > 1000:
         try:
+            with open(tmp_path, "rb") as f:
+                head = f.read(2)
             size = os.stat(tmp_path)[6]
-            with open(tmp_path) as f:
-                f.seek(max(0, size - 200))
-                tail = f.read()
-            valid = OTA_END_MARKER in tail
+            valid = (len(head) == 2 and head[0] == 0x4D and size == total)
+            if valid and expected > 0:
+                valid = (total == expected)
+            elif valid:
+                print("[OTA] server hajmni aytmadi - faqat sehrli belgi tekshirildi")
         except Exception:
             valid = False
 
     if not valid:
-        print("[OTA] fayl to'liq emas yoki noto'g'ri - main.py tegilmadi")
+        print("[OTA] fayl to'liq emas yoki noto'g'ri -", APP_FILE, "tegilmadi")
         try:
             os.remove(tmp_path)
         except OSError:
             pass
         return False
 
-    if _files_identical(tmp_path, "main.py"):
+    if _files_identical(tmp_path, APP_FILE):
         try:
             os.remove(tmp_path)
         except OSError:
@@ -645,14 +697,14 @@ def check_for_update():
     # TIKLANADI. Busiz nosoz yangilanish uch zavodni ham birdan o'ldirishi mumkin
     # va har biriga borib qo'lda tuzatishga to'g'ri kelardi.
     try:
-        _copy_file("main.py", OTA_PREV_FILE)
+        _copy_file(APP_FILE, OTA_PREV_FILE)
         _atomic_write(OTA_PENDING_FILE, "1")
     except Exception as e:
         print("[OTA] zaxira olinmadi, yangilash bekor qilindi:", e)
         _safe_remove(tmp_path)
         return False
 
-    _replace(tmp_path, "main.py")
+    _replace(tmp_path, APP_FILE)
     print("[OTA] yangi kod o'rnatildi, qayta yuklanmoqda...")
     time.sleep(1)
     machine.reset()
@@ -690,7 +742,7 @@ def handle_ota_rollback():
     print("[OTA] yangi kod {} marta barqaror ishlamadi - ESKI VERSIYA tiklanmoqda".format(attempts))
     _safe_remove(OTA_PENDING_FILE)
     try:
-        _copy_file(OTA_PREV_FILE, "main.py")
+        _copy_file(OTA_PREV_FILE, APP_FILE)
         time.sleep(1)
         machine.reset()
     except Exception as e:
@@ -786,6 +838,9 @@ def mqtt_publish(client, topic, payload):
     asosiy tsikl keyingi safar o'zi qayta ulanadi (bu yerda kutib turmaydi)."""
     if client is None:
         return None
+    if not net_write_ready(client):
+        print("[MQTT] soket yozishga tayyor emas - o'lik ulanish yopildi")
+        return mqtt_close(client)
     try:
         client.publish(topic, payload)
         restore_socket_timeout(client)
@@ -951,6 +1006,8 @@ def flush_event_queue(client):
                     kept += 1
                     continue
                 try:
+                    if not net_write_ready(client):
+                        raise OSError("soket yozishga tayyor emas")
                     client.publish(MQTT_EVENTS_TOPIC, out)
                     restore_socket_timeout(client)
                     sent += 1
@@ -1184,7 +1241,7 @@ def main():
             last_check_msg = now
             try:
                 client.check_msg()
-                restore_socket_timeout(client)   # <-- eng muhim tuzatish
+                restore_socket_timeout(client)   # qo'shimcha; asosiysi net_write_ready()
             except Exception as e:
                 print("[MQTT] xabar tekshirishda xato:", e)
                 client = mqtt_close(client)
@@ -1270,7 +1327,7 @@ def main():
         time.sleep(0.05)
 
 
-if __name__ == "__main__":
+def run():
     try:
         main()
     except KeyboardInterrupt:
@@ -1284,5 +1341,9 @@ if __name__ == "__main__":
             pass
         time.sleep(5)
         machine.reset()
+
+
+if __name__ == "__main__":
+    run()
 
 # OTA-FAYL-OXIRI  <- bu qatorsiz OTA yangilanishni qabul qilmaydi (yarim fayl himoyasi)
