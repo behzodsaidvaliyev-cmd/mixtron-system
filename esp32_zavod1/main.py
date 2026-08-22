@@ -51,6 +51,7 @@ CHECK_MSG_INTERVAL_S = 1        # MQTT buyruqlarni tekshirish oralig'i
 WIFI_CONNECT_TIMEOUT_S = 15
 WIFI_RETRY_INTERVAL_S = 20      # ulanmasa, shuncha soniyada qayta urinadi
 WIFI_HEALTH_INTERVAL_S = 30     # ish paytida WiFi uzilmaganini tekshirish oralig'i
+WIFI_RETRY_BACKOFF_S = (30, 60, 300)   # ketma-ket ulanmasa, urinishlar orasi uzayadi
 NTP_RETRY_INTERVAL_S = 60       # vaqt sozlanmagan bo'lsa, qayta urinish oralig'i
 MAX_SANE_DT_S = 300             # bundan katta vaqt farqi = soat sakragan, hisobga olinmaydi
 # NTP protokoli 2036-02-07 da "aylanadi" va ba'zi javoblar 136 yil noto'g'ri
@@ -419,25 +420,71 @@ def led_update(blinks):
         led_set(False)
 
 
-def connect_wifi(timeout_s=WIFI_CONNECT_TIMEOUT_S):
-    ssid, password = load_wifi_config()
+# WiFi ulanishi BLOKLAMAYDI.
+#
+# NIMA UCHUN (haqiqiy qurilmada o'lchangan): avval ulanish tugaguncha kutilardi.
+# Tarmoq yo'q bo'lsa bu har 30 soniyada 16 SONIYA to'xtash degani edi - o'sha
+# paytda PZEM so'rov olmas, holat chirog'i yangilanmas va o'lchovlarning YARMI
+# yo'qolardi (75 soniyada 37 o'rniga 20 ta o'lchov). Endi ulanish faqat
+# BOSHLANADI, natijasi keyingi aylanishlarda tekshiriladi - asosiy tsikl
+# hech qachon to'xtamaydi.
+_wifi_pending = False        # ulanish urinishi davom etyaptimi
+_wifi_started = 0            # urinish boshlangan payt (yoqilgandan beri, soniya)
+_wifi_fails = 0              # ketma-ket muvaffaqiyatsiz urinishlar
+
+
+def wifi_begin():
+    """Ulanishni BOSHLAYDI va darhol qaytadi. Hech narsa kutmaydi."""
+    global _wifi_pending, _wifi_started
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    if not wlan.isconnected():
-        print("[WIFI] ulanmoqda:", ssid)
-        try:
-            wlan.disconnect()
-        except Exception:
-            pass
+    if wlan.isconnected():
+        _wifi_pending = False
+        return True
+    ssid, password = load_wifi_config()
+    print("[WIFI] ulanmoqda:", ssid)
+    try:
+        wlan.disconnect()
+    except Exception:
+        pass
+    try:
         wlan.connect(ssid, password)
-        t0 = time.time()
-        while not wlan.isconnected():
-            feed_wdt()
-            if time.time() - t0 > timeout_s:
-                raise RuntimeError("WiFi ulanish vaqti tugadi")
-            time.sleep(0.5)
-    print("[WIFI] ulandi, ip =", wlan.ifconfig()[0])
-    return wlan
+    except Exception as e:
+        print("[WIFI] ulanishni boshlab bo'lmadi:", e)
+    _wifi_pending = True
+    _wifi_started = uptime_s()
+    return False
+
+
+def wifi_poll():
+    """Har aylanishda chaqiriladi, kutmaydi.
+    Endigina ulangan bo'lsa True qaytaradi - shunda NTP darrov urinadi."""
+    global _wifi_pending, _wifi_fails
+    if not _wifi_pending:
+        return False
+    if wifi_is_up():
+        _wifi_pending = False
+        _wifi_fails = 0
+        try:
+            print("[WIFI] ulandi, ip =", network.WLAN(network.STA_IF).ifconfig()[0])
+        except Exception:
+            print("[WIFI] ulandi")
+        return True
+    if uptime_s() - _wifi_started >= WIFI_CONNECT_TIMEOUT_S:
+        _wifi_pending = False
+        _wifi_fails += 1
+        print("[WIFI] ulanmadi ({}-urinish) - o'lchash davom etmoqda".format(_wifi_fails))
+    return False
+
+
+def wifi_retry_interval():
+    """Tarmoq uzoq vaqt yo'q bo'lsa, bekorga urinavermaslik uchun oraliq o'sadi."""
+    if _wifi_fails <= 0:
+        return WIFI_HEALTH_INTERVAL_S
+    i = _wifi_fails - 1
+    if i >= len(WIFI_RETRY_BACKOFF_S):
+        i = len(WIFI_RETRY_BACKOFF_S) - 1
+    return WIFI_RETRY_BACKOFF_S[i]
 
 
 def wifi_is_up():
@@ -1173,9 +1220,9 @@ def main():
     # yozilmasdi. Holbuki oflayn hisoblash tizimning asosiy vazifasi.
     # Endi tarmoq bo'lmasa ham o'lchash ishlaydi, WiFi fonda tiklanadi.
     try:
-        connect_wifi()
+        wifi_begin()          # boshlanadi, kutilmaydi - o'lchash darrov ishlaydi
     except Exception as e:
-        print("[WIFI] boshlang'ich ulanish bo'lmadi:", e, "- OFLAYN davom etadi")
+        print("[WIFI] ulanishni boshlab bo'lmadi:", e, "- OFLAYN davom etadi")
 
     # NTP: vaqt sozlanmasa voqealar noto'g'ri sanaga tushadi. Ulanmasa,
     # tsikl ichida qayta urinib turiladi.
@@ -1212,6 +1259,10 @@ def main():
         check_serial_commands()
         now = time.time()
 
+        # WiFi ulanishi FONDA kuzatiladi - bu yerda hech narsa kutilmaydi.
+        if wifi_poll():                # endigina ulandi
+            last_ntp_retry = 0         # NTP darrov urinsin, 60 soniya kutmasin
+
         # --- Holat chirog'i ---
         if not wifi_is_up():
             led_update(LED_NO_WIFI)
@@ -1240,21 +1291,17 @@ def main():
         # MUHIM: ishlash paytida WiFi uzilib qolsa (router qayta yuklandi,
         # signal yo'qoldi), eski kod uni HECH QACHON qayta ulamas edi - qurilma
         # abadiy "ko'r" holatda ishlab yuraverardi. Endi davriy tekshiriladi.
-        if now - last_wifi_check >= WIFI_HEALTH_INTERVAL_S:
+        # Ulanish BOSHLANADI va shu yerda tugaydi - natijasi wifi_poll() da
+        # kuzatiladi. Shuning uchun PZEM va chiroq bir zum ham to'xtamaydi.
+        if (not _wifi_pending) and now - last_wifi_check >= wifi_retry_interval():
             last_wifi_check = now
             if not wifi_is_up():
-                print("[WIFI] uzilgan - qayta ulanmoqda")
+                print("[WIFI] uzilgan - qayta ulanmoqda (o'lchash to'xtamaydi)")
                 client = mqtt_close(client)
                 try:
-                    connect_wifi()
-                    if not time_is_valid():
-                        sync_time()
-                        now = time.time()          # NTP vaqtni sakratgan bo'lishi mumkin
-                        last_poll = now            # taymerlar qayta hisoblanadi
-                        last_publish = last_save = last_check_msg = now
-                        last_wifi_check = last_ntp_retry = now
+                    wifi_begin()
                 except Exception as e:
-                    print("[WIFI] qayta ulanmadi:", e)
+                    print("[WIFI] ulanishni boshlab bo'lmadi:", e)
 
         # --- NTP hali sozlanmagan bo'lsa, qayta urinish ---
         if (not time_is_valid()) and wifi_is_up() and now - last_ntp_retry >= NTP_RETRY_INTERVAL_S:

@@ -50,6 +50,7 @@ class World:
         self.mqtt_connects = 0
         self.wifi_connects = 0
         self.uart_reinits = 0
+        self.pzem_reads = 0           # PZEM ga yuborilgan so'rovlar soni
         self.flash_writes = 0
         self.led_writes = 0
         self.led_state = 0
@@ -136,6 +137,7 @@ class FakeUART:
                            W.pzem_voltage * W.pzem_current * 0.8, 12345, 50.0, 0.8)
 
     def write(self, data):
+        W.pzem_reads += 1      # o'lchash to'xtamaganini sanash uchun
         return len(data)
 
     def deinit(self):

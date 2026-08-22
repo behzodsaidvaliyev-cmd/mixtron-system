@@ -301,6 +301,22 @@ def run_all():
            int(pl.split("|")[1]) > 2250000000]
     check("xato sanali voqea yuborilmadi", not bad, bad[:2])
 
+    print("\n=== 14. WiFi YO-Q paytida O-LCHASH TO-XTAMASLIGI kerak ===")
+    # Haqiqiy qurilmada topilgan nosozlik: WiFi ga ulanish tugaguncha
+    # kutilardi va har 30 soniyada 16 soniya PZEM o-qilmasdi, chiroq
+    # qotib qolardi, o-lchovlarning yarmi yo-qolardi.
+    W.__init__()
+    new_device(tmp)
+    W.wifi_up = False
+    W.wifi_can_connect = False        # tarmoq umuman yo-q
+    out = boot(120)
+    kutilgan = 120 // 2               # POLL_INTERVAL_S = 2
+    check("WiFi yo-q bo-lsa ham PZEM muntazam o-qildi",
+          W.pzem_reads >= kutilgan * 3 // 4,
+          "{} ta so-rov (kutilgan ~{})".format(W.pzem_reads, kutilgan))
+    check("holat chirog-i yangilanishda davom etdi", W.led_writes > 100,
+          "{} marta".format(W.led_writes))
+
     print("\n=== 13. Yoqilish xabari Railway'ga ketyaptimi ===")
     W.__init__()
     new_device(tmp)
