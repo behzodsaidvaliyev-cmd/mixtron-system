@@ -5,7 +5,7 @@ import json
 import calendar
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 import paho.mqtt.client as mqtt
 
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "5a03687ae2394725ba4e934337264c51.s1.eu.hivemq.cloud")
@@ -285,11 +285,18 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         elif parsed.path == "/events.csv":
+            # from/to berilmasa - butun tarix (eski xatti-harakat saqlanadi)
+            try:
+                from_ts = parse_time_param(params.get("from", [None])[0], 0)
+                to_ts = parse_time_param(params.get("to", [None])[0], time.time())
+            except Exception as e:
+                self._send_error(400, e)
+                return
             with db_lock:
                 rows = conn.execute(
                     "SELECT event_time_local, event_type, motosoat FROM cycle_events "
-                    "WHERE device = ? ORDER BY event_ts ASC",
-                    (device,),
+                    "WHERE device = ? AND event_ts BETWEEN ? AND ? ORDER BY event_ts ASC",
+                    (device, from_ts, to_ts),
                 ).fetchall()
             lines = ["Vaqt;Holat;Motosoat"]
             for r in rows:
@@ -330,24 +337,43 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elif parsed.path == "/events.html":
+            try:
+                from_ts = parse_time_param(params.get("from", [None])[0], 0)
+                to_ts = parse_time_param(params.get("to", [None])[0], time.time())
+            except Exception as e:
+                self._send_error(400, e)
+                return
             with db_lock:
                 rows = conn.execute(
                     "SELECT event_time_local, event_type, motosoat FROM cycle_events "
-                    "WHERE device = ? ORDER BY event_ts DESC LIMIT 300",
-                    (device,),
+                    "WHERE device = ? AND event_ts BETWEEN ? AND ? "
+                    "ORDER BY event_ts DESC LIMIT 1000",
+                    (device, from_ts, to_ts),
                 ).fetchall()
             table_rows = "".join(
                 "<tr><td>{}</td><td>{}</td><td>{:.4f}</td></tr>".format(r[0], r[1], r[2])
                 for r in rows
             )
+            # Yuklab olish havolasi HAM shu davrga tegishli bo'lishi kerak,
+            # aks holda jadvalda bir davr, Excel'da butun tarix chiqadi.
+            span = ""
+            if params.get("from") or params.get("to"):
+                span = "&from={}&to={}".format(
+                    quote(params.get("from", [""])[0]), quote(params.get("to", [""])[0]))
+                sarlavha = "{} - {} oralig&#39;idagi voqealar ({} ta)".format(
+                    params.get("from", ["boshidan"])[0],
+                    params.get("to", ["hozirgacha"])[0], len(rows))
+            else:
+                sarlavha = "ON/OFF voqealari (oxirgi {} ta)".format(len(rows))
             html = (
                 "<!doctype html><html><head><meta charset='utf-8'>"
                 "<title>{device} - voqealar</title><style>{style}</style></head><body>"
-                "<h2>{device} - ON/OFF voqealari</h2>"
-                "<a class='download' href='/events.csv?zavod={device}'>Excel (CSV) yuklab olish</a>"
+                "<h2>{device} - {sarlavha}</h2>"
+                "<a class='download' href='/events.csv?zavod={device}{span}'>Excel (CSV) yuklab olish</a>"
                 "<table><tr><th>Vaqt</th><th>Holat</th><th>Motosoat</th></tr>{rows}</table>"
                 "</body></html>"
-            ).format(device=device, style=EVENTS_TABLE_STYLE, rows=table_rows)
+            ).format(device=device, style=EVENTS_TABLE_STYLE, rows=table_rows,
+                     sarlavha=sarlavha, span=span)
             body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
