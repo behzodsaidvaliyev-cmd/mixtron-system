@@ -401,6 +401,9 @@ class Handler(BaseHTTPRequestHandler):
                 for r in rows
             )
             boot_soni = sum(1 for r in rows if r[1] == "BOOT")
+            # Dashboard "BOOT siz" ochsa (&boot=0), sahifa DARROV shu holatda
+            # ochilishi kerak - foydalanuvchi qayta bosib o'tirmasin.
+            boot_kerak = params.get("boot", ["1"])[0] != "0"
             # Yuklab olish havolasi HAM shu davrga tegishli bo'lishi kerak,
             # aks holda jadvalda bir davr, Excel'da butun tarix chiqadi.
             span = ""
@@ -420,7 +423,7 @@ class Handler(BaseHTTPRequestHandler):
                 "<h2>{device} - {sarlavha}</h2>"
                 "<div class='jami'>Jami ishlagan vaqt: <b>{jami}</b></div><br>"
                 "<label class='chk'>"
-                "<input type='checkbox' id='bootChk' checked onchange='bootToggle()'>"
+                "<input type='checkbox' id='bootChk' {boot_belgi} onchange='bootToggle()'>"
                 " BOOT ({boot_soni} ta) ko&#39;rsatilsin"
                 "<span class='izoh'>BOOT - qurilma qayta yoqilgani, drobilkaning ishi emas</span>"
                 "</label>"
@@ -438,11 +441,13 @@ class Handler(BaseHTTPRequestHandler):
                 "if(s){{s.textContent=ko?JAMI:JAMI-BOOTLAR;}}"
                 "document.getElementById('yuk').href=ASOS+(ko?'':'&boot=0');"
                 "}}"
+                "bootToggle();"          # sahifa ochilishida holat qo'llaniladi
                 "</script>"
                 "</body></html>"
             ).format(device=device, style=EVENTS_TABLE_STYLE, rows=table_rows,
                      sarlavha=sarlavha, span=span, jami=soat_matn(jami_soat),
-                     boot_soni=boot_soni, jami_qator=len(rows))
+                     boot_soni=boot_soni, jami_qator=len(rows),
+                     boot_belgi="checked" if boot_kerak else "")
             body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
