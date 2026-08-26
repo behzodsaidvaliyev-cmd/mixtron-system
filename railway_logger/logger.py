@@ -252,6 +252,11 @@ EVENTS_TABLE_STYLE = """
         .jami{background:#2c3e50;border-left:5px solid #f1c40f;padding:12px 18px;
             margin:0 0 16px 0;font-size:18px;border-radius:4px;display:inline-block}
         .jami b{color:#f1c40f;font-size:22px}
+        label.chk{display:inline-block;margin:0 18px 16px 0;cursor:pointer;
+            background:#2c3e50;padding:9px 14px;border-radius:4px}
+        label.chk input{margin-right:6px;transform:scale(1.2)}
+        .izoh{color:#8aa0b3;font-size:12px;margin-left:10px}
+        tr.boot td{color:#8aa0b3;font-style:italic}
 """
 
 
@@ -316,10 +321,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_error(400, e)
                 return
+            # boot=0 -> BOOT qatorlari chiqarilmaydi. Brauzerdagi kalochka
+            # shu parametrni qo'shadi, shunda Excel ekranda ko'rinayotgan
+            # ro'yxat bilan bir xil bo'ladi.
+            boot_kerak = params.get("boot", ["1"])[0] != "0"
+            shart = "" if boot_kerak else " AND event_type != 'BOOT'"
             with db_lock:
                 rows = conn.execute(
                     "SELECT event_time_local, event_type, motosoat FROM cycle_events "
-                    "WHERE device = ? AND event_ts BETWEEN ? AND ? ORDER BY event_ts ASC",
+                    "WHERE device = ? AND event_ts BETWEEN ? AND ?" + shart +
+                    " ORDER BY event_ts ASC",
                     (device, from_ts, to_ts),
                 ).fetchall()
             lines = ["Vaqt;Holat;Motosoat"]
@@ -381,31 +392,57 @@ class Handler(BaseHTTPRequestHandler):
             # DIQQAT: bu chaqiruv db_lock ICHIDA bo'lmasligi SHART -
             # compute_hours_range() ichida qulf qaytadan olinadi.
             jami_soat = compute_hours_range(conn, device, from_ts, to_ts)
+            # BOOT qatorlari alohida belgilanadi - foydalanuvchi ularni
+            # kalochka bilan yashira oladi. BOOT drobilkaning ishi emas,
+            # qurilmaning qayta yoqilgani, shuning uchun ro'yxatni chalg'itadi.
             table_rows = "".join(
-                "<tr><td>{}</td><td>{}</td><td>{:.4f}</td></tr>".format(r[0], r[1], r[2])
+                "<tr class='{}'><td>{}</td><td>{}</td><td>{:.4f}</td></tr>".format(
+                    "boot" if r[1] == "BOOT" else "ish", r[0], r[1], r[2])
                 for r in rows
             )
+            boot_soni = sum(1 for r in rows if r[1] == "BOOT")
             # Yuklab olish havolasi HAM shu davrga tegishli bo'lishi kerak,
             # aks holda jadvalda bir davr, Excel'da butun tarix chiqadi.
             span = ""
             if params.get("from") or params.get("to"):
                 span = "&from={}&to={}".format(
                     quote(params.get("from", [""])[0]), quote(params.get("to", [""])[0]))
-                sarlavha = "{} - {} oralig&#39;idagi voqealar ({} ta)".format(
+                sarlavha = ("{} - {} oralig&#39;idagi voqealar "
+                            "(<span id='soni'>{}</span> ta)").format(
                     params.get("from", ["boshidan"])[0],
                     params.get("to", ["hozirgacha"])[0], len(rows))
             else:
-                sarlavha = "ON/OFF voqealari (oxirgi {} ta)".format(len(rows))
+                sarlavha = ("ON/OFF voqealari "
+                            "(oxirgi <span id='soni'>{}</span> ta)").format(len(rows))
             html = (
                 "<!doctype html><html><head><meta charset='utf-8'>"
                 "<title>{device} - voqealar</title><style>{style}</style></head><body>"
                 "<h2>{device} - {sarlavha}</h2>"
                 "<div class='jami'>Jami ishlagan vaqt: <b>{jami}</b></div><br>"
-                "<a class='download' href='/events.csv?zavod={device}{span}'>Excel (CSV) yuklab olish</a>"
+                "<label class='chk'>"
+                "<input type='checkbox' id='bootChk' checked onchange='bootToggle()'>"
+                " BOOT ({boot_soni} ta) ko&#39;rsatilsin"
+                "<span class='izoh'>BOOT - qurilma qayta yoqilgani, drobilkaning ishi emas</span>"
+                "</label>"
+                "<a class='download' id='yuk' href='/events.csv?zavod={device}{span}'>"
+                "Excel (CSV) yuklab olish</a>"
                 "<table><tr><th>Vaqt</th><th>Holat</th><th>Motosoat</th></tr>{rows}</table>"
+                "<script>"
+                "var JAMI={jami_qator},BOOTLAR={boot_soni},"
+                "ASOS=\"/events.csv?zavod={device}{span}\";"
+                "function bootToggle(){{"
+                "var ko=document.getElementById('bootChk').checked;"
+                "var q=document.querySelectorAll('tr.boot');"
+                "for(var i=0;i<q.length;i++){{q[i].style.display=ko?'':'none';}}"
+                "var s=document.getElementById('soni');"
+                "if(s){{s.textContent=ko?JAMI:JAMI-BOOTLAR;}}"
+                "document.getElementById('yuk').href=ASOS+(ko?'':'&boot=0');"
+                "}}"
+                "</script>"
                 "</body></html>"
             ).format(device=device, style=EVENTS_TABLE_STYLE, rows=table_rows,
-                     sarlavha=sarlavha, span=span, jami=soat_matn(jami_soat))
+                     sarlavha=sarlavha, span=span, jami=soat_matn(jami_soat),
+                     boot_soni=boot_soni, jami_qator=len(rows))
             body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
