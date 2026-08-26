@@ -23,7 +23,10 @@ HTTP_PORT = int(os.environ.get("PORT", "8080"))
 UZ_OFFSET = 5 * 3600  # O'zbekiston UTC+5
 DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "zavod3")  # ?zavod= berilmasa, shu ishlatiladi
 
-db_lock = threading.Lock()
+# RLock (oddiy Lock emas): qulf olgan funksiya ichidan yana qulf
+# oladigan funksiya chaqirilsa, oddiy Lock butun xizmatni abadiy
+# qotirib qo'yadi. RLock bunday holatda xavfsiz ishlaydi.
+db_lock = threading.RLock()
 
 
 def get_conn():
@@ -371,10 +374,13 @@ class Handler(BaseHTTPRequestHandler):
                     "ORDER BY event_ts DESC LIMIT 1000",
                     (device, from_ts, to_ts),
                 ).fetchall()
-                # Ro'yxatning o'zi "jami qancha ishladi" degan savolga javob
-                # bermaydi - odam ON/OFF larni qo'lda qo'shib chiqishi kerak
-                # bo'lardi. Shuning uchun jami vaqt shu yerda hisoblanadi.
-                jami_soat = compute_hours_range(conn, device, from_ts, to_ts)
+            # Ro'yxatning o'zi "jami qancha ishladi" degan savolga javob
+            # bermaydi - odam ON/OFF larni qo'lda qo'shib chiqishi kerak
+            # bo'lardi. Shuning uchun jami vaqt shu yerda hisoblanadi.
+            #
+            # DIQQAT: bu chaqiruv db_lock ICHIDA bo'lmasligi SHART -
+            # compute_hours_range() ichida qulf qaytadan olinadi.
+            jami_soat = compute_hours_range(conn, device, from_ts, to_ts)
             table_rows = "".join(
                 "<tr><td>{}</td><td>{}</td><td>{:.4f}</td></tr>".format(r[0], r[1], r[2])
                 for r in rows
