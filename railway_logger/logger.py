@@ -209,6 +209,24 @@ def compute_hours_month(conn, device):
     return compute_hours_range(conn, device, local_midnight_utc_ts(month_start_local), now_utc)
 
 
+def soat_matn(soat):
+    """Kasr soatni odam o'qiydigan ko'rinishga aylantiradi.
+
+    17.83 -> "17.83 soat (17:50)". Kasr son hisob-kitobga qulay, lekin
+    "17.83 soat" necha daqiqa ekanini ko'z bilan chamalash qiyin.
+    """
+    try:
+        s = float(soat)
+    except (TypeError, ValueError):
+        return "-- soat"
+    butun = int(s)
+    daqiqa = int(round((s - butun) * 60))
+    if daqiqa == 60:                 # yaxlitlash "17:60" bo'lib qolmasin
+        butun += 1
+        daqiqa = 0
+    return "{:.2f} soat ({}:{:02d})".format(s, butun, daqiqa)
+
+
 def parse_time_param(value, default):
     """Qiymat Unix vaqt yoki mahalliy sana/vaqt satri ('YYYY-MM-DD HH:MM') bo'lishi mumkin."""
     if value is None:
@@ -228,6 +246,9 @@ EVENTS_TABLE_STYLE = """
         th,td{border:1px solid #445;padding:8px 12px;text-align:left}
         th{background:#34495e}
         tr:nth-child(even){background:#25303d}
+        .jami{background:#2c3e50;border-left:5px solid #f1c40f;padding:12px 18px;
+            margin:0 0 16px 0;font-size:18px;border-radius:4px;display:inline-block}
+        .jami b{color:#f1c40f;font-size:22px}
 """
 
 
@@ -350,6 +371,10 @@ class Handler(BaseHTTPRequestHandler):
                     "ORDER BY event_ts DESC LIMIT 1000",
                     (device, from_ts, to_ts),
                 ).fetchall()
+                # Ro'yxatning o'zi "jami qancha ishladi" degan savolga javob
+                # bermaydi - odam ON/OFF larni qo'lda qo'shib chiqishi kerak
+                # bo'lardi. Shuning uchun jami vaqt shu yerda hisoblanadi.
+                jami_soat = compute_hours_range(conn, device, from_ts, to_ts)
             table_rows = "".join(
                 "<tr><td>{}</td><td>{}</td><td>{:.4f}</td></tr>".format(r[0], r[1], r[2])
                 for r in rows
@@ -369,11 +394,12 @@ class Handler(BaseHTTPRequestHandler):
                 "<!doctype html><html><head><meta charset='utf-8'>"
                 "<title>{device} - voqealar</title><style>{style}</style></head><body>"
                 "<h2>{device} - {sarlavha}</h2>"
+                "<div class='jami'>Jami ishlagan vaqt: <b>{jami}</b></div><br>"
                 "<a class='download' href='/events.csv?zavod={device}{span}'>Excel (CSV) yuklab olish</a>"
                 "<table><tr><th>Vaqt</th><th>Holat</th><th>Motosoat</th></tr>{rows}</table>"
                 "</body></html>"
             ).format(device=device, style=EVENTS_TABLE_STYLE, rows=table_rows,
-                     sarlavha=sarlavha, span=span)
+                     sarlavha=sarlavha, span=span, jami=soat_matn(jami_soat))
             body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
