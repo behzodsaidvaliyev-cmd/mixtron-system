@@ -5,7 +5,8 @@ import json
 import calendar
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, quote
+import urllib.request
+from urllib.parse import urlparse, parse_qs, quote, urlencode
 import paho.mqtt.client as mqtt
 
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "5a03687ae2394725ba4e934337264c51.s1.eu.hivemq.cloud")
@@ -22,6 +23,16 @@ DB_PATH = os.environ.get("DB_PATH", "/data/mixtron.db")
 HTTP_PORT = int(os.environ.get("PORT", "8080"))
 UZ_OFFSET = 5 * 3600  # O'zbekiston UTC+5
 DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "zavod3")  # ?zavod= berilmasa, shu ishlatiladi
+
+# --- Jimlik nazorati ---
+# Qurilma o'chsa yoki internetdan uzilsa, buni hech kim sezmasdan kunlab
+# ma'lumot yo'qolishi mumkin - bir marta uchala qurilma olti kun jim qolgan
+# va buni ancha keyin payqaganmiz. Shuning uchun jimlik alohida kuzatiladi.
+SILENCE_LIMIT_S = int(os.environ.get("SILENCE_LIMIT_S", "600"))   # 10 daqiqa
+SILENCE_CHECK_S = int(os.environ.get("SILENCE_CHECK_S", "60"))    # tekshirish oralig'i
+SILENCE_FORGET_S = 7 * 86400        # shuncha vaqt ko'rinmagan qurilma kuzatilmaydi
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # RLock (oddiy Lock emas): qulf olgan funksiya ichidan yana qulf
 # oladigan funksiya chaqirilsa, oddiy Lock butun xizmatni abadiy
@@ -455,11 +466,86 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif parsed.path == "/holat":
+            self._send_json({
+                "chegara_daqiqa": SILENCE_LIMIT_S // 60,
+                "zavodlar": jimlik_holati(conn),
+            })
+
         else:
             self._send_error(404, "not found")
 
     def log_message(self, format, *args):
         pass  # standart konsolni shovqindan tozalash
+
+
+def telegram_yubor(matn):
+    """Xabar Telegramga yuboriladi. Sozlanmagan bo'lsa xizmat baribir ishlaydi -
+    xabar faqat jurnalga tushadi, shunda sozlashdan oldin sinab ko'rish mumkin."""
+    print("[OGOH]", matn.replace(chr(10), " | "))
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    try:
+        url = "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN)
+        data = urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": matn}).encode("utf-8")
+        with urllib.request.urlopen(url, data=data, timeout=15) as r:
+            r.read()
+        return True
+    except Exception as e:
+        print("[OGOH] Telegramga yuborilmadi:", e)
+        return False
+
+
+def jimlik_holati(conn, hozir=None):
+    """Har bir qurilma uchun: oxirgi ma'lumot qachon kelgan va jim qolganmi."""
+    hozir = time.time() if hozir is None else hozir
+    with db_lock:
+        rows = conn.execute(
+            "SELECT device, MAX(received_ts) FROM readings "
+            "WHERE received_ts > ? GROUP BY device",
+            (hozir - SILENCE_FORGET_S,),
+        ).fetchall()
+    natija = []
+    for device, oxirgi in rows:
+        if not oxirgi:
+            continue
+        jim_s = hozir - oxirgi
+        natija.append({
+            "zavod": device,
+            "oxirgi": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(oxirgi + UZ_OFFSET)),
+            "jim_daqiqa": int(jim_s // 60),
+            "jim": jim_s >= SILENCE_LIMIT_S,
+        })
+    natija.sort(key=lambda x: x["zavod"])
+    return natija
+
+
+_jim_belgilangan = {}      # qurilma -> ogohlantirish yuborilganmi
+
+
+def jimlik_kuzatuvchisi(conn):
+    """Fon oqimi: jimlik boshlanganda va tugaganda BITTADAN xabar yuboradi.
+    Holat o'zgarmasa qayta yubormaydi - aks holda har daqiqada bezovta qilardi."""
+    print("[OGOH] jimlik nazorati yoqildi: chegara {} daqiqa, Telegram {}".format(
+        SILENCE_LIMIT_S // 60,
+        "sozlangan" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "SOZLANMAGAN"))
+    while True:
+        time.sleep(SILENCE_CHECK_S)
+        try:
+            for h in jimlik_holati(conn):
+                zavod = h["zavod"]
+                oldin = _jim_belgilangan.get(zavod, False)
+                if h["jim"] and not oldin:
+                    _jim_belgilangan[zavod] = True
+                    telegram_yubor(
+                        "⚠ {} - {} daqiqadan beri ma'lumot yo'q".format(
+                            zavod, h["jim_daqiqa"])
+                        + chr(10) + "Oxirgi ma'lumot: " + h["oxirgi"])
+                elif (not h["jim"]) and oldin:
+                    _jim_belgilangan[zavod] = False
+                    telegram_yubor("✅ {} - aloqa tiklandi".format(zavod))
+        except Exception as e:
+            print("[OGOH] kuzatuvda xato:", e)
 
 
 def run_http_server(conn):
@@ -474,6 +560,9 @@ def main():
 
     http_thread = threading.Thread(target=run_http_server, args=(conn,), daemon=True)
     http_thread.start()
+
+    ogoh_thread = threading.Thread(target=jimlik_kuzatuvchisi, args=(conn,), daemon=True)
+    ogoh_thread.start()
 
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
