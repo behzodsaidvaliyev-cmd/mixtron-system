@@ -32,6 +32,18 @@ DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "zavod3")  # ?zavod= berilmasa
 # aylanishiga tushgan (2036-yil) degani. Loyiha 2026-yilda boshlangan.
 EVENT_TS_MIN = 1750000000       # ~2025-06-15
 
+# Bir martalik tuzatish. zavod3 da 2026-09-06 21:31 da yozilgan uchta voqea
+# 5 soatlik uzilishdan keyin yuborilgan va serverda QABUL QILINGAN lahza
+# (02:40:05) bilan saqlangan. Haqiqiy vaqt taxmin emas - o'sha motosoat
+# qiymatlari o'lchovlarda aynan quyidagi soniyalarda qayd etilgan.
+# Sabab qurilma kodida tuzatilgan, shuning uchun bu ro'yxat o'smaydi.
+# Ustunlar: zavod, bazadagi sana, holat, motosoat, haqiqiy sana
+BIR_MARTALIK_TUZATISH = [
+    ("zavod3", "2026-09-07 02:40:05", "BOOT", 197.8959, "2026-09-06 21:31:44"),
+    ("zavod3", "2026-09-07 02:40:05", "OFF",  197.8959, "2026-09-06 21:31:44"),
+    ("zavod3", "2026-09-07 02:40:05", "ON",   197.8964, "2026-09-06 21:31:50"),
+]
+
 SILENCE_LIMIT_S = int(os.environ.get("SILENCE_LIMIT_S", "600"))   # 10 daqiqa
 SILENCE_CHECK_S = int(os.environ.get("SILENCE_CHECK_S", "60"))    # tekshirish oralig'i
 SILENCE_FORGET_S = 7 * 86400        # shuncha vaqt ko'rinmagan qurilma kuzatilmaydi
@@ -151,6 +163,32 @@ def get_conn():
                 time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(yangi_ts + UZ_OFFSET))))
         conn.commit()
         print("[DB] jami {} ta ishonchsiz sanali voqea to'g'rilandi".format(len(yomon)))
+
+    # Aniq ma'lum bo'lgan yakka yozuvlarni to'g'rilash (yuqoridagi ro'yxat).
+    # Sana bazadagi qiymatga TO'LIQ mos kelsagina almashtiriladi - shu sabab
+    # ikkinchi ishga tushirishda hech narsa o'zgarmaydi.
+    tuzatildi = 0
+    for device, eski_local, tur, ms, yangi_local in BIR_MARTALIK_TUZATISH:
+        try:
+            eski_ts = local_str_to_utc_ts(eski_local)
+            yangi_ts = local_str_to_utc_ts(yangi_local)
+        except Exception:
+            continue
+        cur = conn.execute(
+            "UPDATE cycle_events SET event_ts = ?, event_time_local = ? "
+            "WHERE device = ? AND event_ts = ? AND event_type = ? "
+            "AND ABS(motosoat - ?) < 0.00005",
+            (yangi_ts,
+             time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(yangi_ts + UZ_OFFSET)),
+             device, eski_ts, tur, ms),
+        )
+        if cur.rowcount:
+            tuzatildi += cur.rowcount
+            print("[DB] {} : {} {} -> {} (aniqlangan haqiqiy vaqt)".format(
+                device, tur, eski_local, yangi_local))
+    if tuzatildi:
+        conn.commit()
+        print("[DB] jami {} ta voqea sanasi aniqlashtirildi".format(tuzatildi))
 
     return conn
 
