@@ -28,6 +28,10 @@ DEFAULT_DEVICE = os.environ.get("DEFAULT_DEVICE", "zavod3")  # ?zavod= berilmasa
 # Qurilma o'chsa yoki internetdan uzilsa, buni hech kim sezmasdan kunlab
 # ma'lumot yo'qolishi mumkin - bir marta uchala qurilma olti kun jim qolgan
 # va buni ancha keyin payqaganmiz. Shuning uchun jimlik alohida kuzatiladi.
+# Bundan oldingi sana = qurilmada soat bo'lmagan (2000-yil) yoki NTP
+# aylanishiga tushgan (2036-yil) degani. Loyiha 2026-yilda boshlangan.
+EVENT_TS_MIN = 1750000000       # ~2025-06-15
+
 SILENCE_LIMIT_S = int(os.environ.get("SILENCE_LIMIT_S", "600"))   # 10 daqiqa
 SILENCE_CHECK_S = int(os.environ.get("SILENCE_CHECK_S", "60"))    # tekshirish oralig'i
 SILENCE_FORGET_S = 7 * 86400        # shuncha vaqt ko'rinmagan qurilma kuzatilmaydi
@@ -109,6 +113,44 @@ def get_conn():
     if event_rows:
         conn.commit()
         print("[DB] {} ta eski voqeaga mahalliy vaqt to'ldirildi".format(len(event_rows)))
+
+    # ISHONCHSIZ SANALI voqealarni tarix boshiga ko'chirish.
+    #
+    # Qurilmalarni sozlash kunlarida soat himoyasi hali yo'q edi: soati
+    # sozlanmagan qurilma voqealarni 2000-yil sanasi bilan, NTP aylanishiga
+    # tushgani esa 2036-yil sanasi bilan yozib yuborgan. 2036-yilgi yozuv
+    # ro'yxatda eng tepaga chiqib, haqiqiy voqealarni pastga suradi.
+    #
+    # Yozuv O'CHIRILMAYDI: faqat sanasi shu qurilmaning eng birinchi haqiqiy
+    # o'lchovi vaqtiga qo'yiladi. Motosoat va holat qiymatlari saqlanadi.
+    hozir = time.time()
+    yomon = conn.execute(
+        "SELECT id, device, event_ts FROM cycle_events "
+        "WHERE event_ts < ? OR event_ts > ?",
+        (EVENT_TS_MIN, hozir + 86400),
+    ).fetchall()
+    if yomon:
+        birinchi = {}
+        for row_id, device, eski_ts in yomon:
+            if device not in birinchi:
+                r = conn.execute(
+                    "SELECT MIN(received_ts) FROM readings WHERE device = ? AND received_ts >= ?",
+                    (device, EVENT_TS_MIN),
+                ).fetchone()
+                birinchi[device] = (r[0] if r and r[0] else hozir)
+            yangi_ts = birinchi[device]
+            conn.execute(
+                "UPDATE cycle_events SET event_ts = ?, event_time_local = ? WHERE id = ?",
+                (yangi_ts,
+                 time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(yangi_ts + UZ_OFFSET)),
+                 row_id),
+            )
+            print("[DB] {} : {} -> {} (ishonchsiz sana to'g'rilandi)".format(
+                device,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(eski_ts + UZ_OFFSET)),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(yangi_ts + UZ_OFFSET))))
+        conn.commit()
+        print("[DB] jami {} ta ishonchsiz sanali voqea to'g'rilandi".format(len(yomon)))
 
     return conn
 
