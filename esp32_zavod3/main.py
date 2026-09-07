@@ -1043,8 +1043,10 @@ def _resolve_event_time(line):
             age = 0
     else:
         # Orada qayta yuklangan: qurilmada soat yo'q, u o'chiq turgan vaqtni
-        # bilolmaydi. Eng halol taxmin - "aloqa tiklangan payt".
-        age = 0
+        # bilolmaydi. Lekin bitta narsa ANIQ - voqea joriy yoqilishdan OLDIN
+        # bo'lgan. Shuning uchun "hozir" emas, "shu yoqilish boshlangan payt"
+        # olinadi: bu xatoni kamaytiradi va hech qachon kelajakka surmaydi.
+        age = uptime_s()
 
     parts[1] = str(int(time.time() + UNIX_EPOCH_OFFSET) - age)
     return "|".join(parts[:4])       # 5-maydon (yoqilish raqami) yuborilmaydi
@@ -1060,6 +1062,15 @@ def flush_event_queue(client):
 
     if client is None:
         return client  # ulanish yo'q - keyingi safar
+
+    # Vaqt hali noma'lum bo'lsa, navbatni yuborishdan OLDIN soat tiklanadi.
+    # HAQIQIY QURILMADA KUZATILGAN: qayta yoqilgandan keyin internet 5 soat
+    # yo'q bo'lgan; navbat soatdan OLDIN yuborilgani uchun uchala voqea
+    # "vaqtsiz" ketgan va serverda QABUL QILINGAN lahza (02:40) bilan
+    # yozilgan - aslida ular 21:31 da sodir bo'lgan edi.
+    # Bu yerda ulanish bor (client mavjud), demak NTP ham yetib borishi kerak.
+    if not time_is_valid():
+        sync_time()
 
     sent = 0
     kept = 0                 # navbatda QOLDIRILGAN qatorlar soni

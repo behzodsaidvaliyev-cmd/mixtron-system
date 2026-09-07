@@ -200,8 +200,53 @@ def run_all():
         ok = ts > 1700000000 and ts <= real_now + 5
         check("vaqt HAQIQIY sanaga tuzatildi", ok,
               "ts={} (hozir={})".format(ts, int(real_now)))
+        # Voqea OLDINGI yoqilishda bo'lgan, demak u joriy yoqilishdan OLDIN
+        # sodir bo'lgani ANIQ. Eski kod uni "hozir" deb yozardi - bu bilib
+        # turib noto'g'ri. Endi eng kechi - shu yoqilish boshlangan payt.
+        check("oldingi yoqilishdagi voqea 'hozir' deb yozilmadi",
+              real_now - ts >= 5,
+              "voqea {:.0f} soniya oldin deb yozildi".format(real_now - ts))
 
     # =====================================================================
+    print("\n=== 7b. UZOQ oflayn qolib, SHU YOQILISHDA internet qaytsa ===")
+    # HAQIQIY QURILMADA KUZATILGAN NOSOZLIK: qayta yoqilgandan keyin
+    # internet 5 soat yo-q edi. Navbat soat tiklanishidan OLDIN yuborilgani
+    # uchun voqealar "vaqtsiz" ketgan va serverda QABUL QILINGAN lahza
+    # bilan yozilgan - haqiqiy vaqtdan 5 soat farq qilgan.
+    W.__init__()
+    new_device(tmp)
+    W.clock = 100000.0                  # NTP yo-q: soat 2000-yilda
+    W.wifi_up = False
+    W.wifi_can_connect = False
+    W.ntp_works = False
+    W.pzem_current = 9.0
+
+    asl_advance = W.advance
+    def _tarmoq_qaytadi(sec):
+        # Yarim soat oflayn turgach, SHU yoqilishning ichida internet keladi
+        asl_advance(sec)
+        if W.mono >= 1800 and not W.wifi_can_connect:
+            W.wifi_can_connect = True
+            W.ntp_works = True
+    W.advance = _tarmoq_qaytadi
+    try:
+        out = boot(2400)
+    finally:
+        del W.advance                   # keyingi senariylarga ta-sir qilmasin
+
+    yuborilgan = event_lines()
+    check("uzoq oflayndan keyin voqealar yuborildi", len(yuborilgan) > 0,
+          "{} ta".format(len(yuborilgan)))
+    vaqtsiz = [x for x in yuborilgan if int(x.split("|")[1]) <= 0]
+    check("bironta voqea VAQTSIZ ketmadi", not vaqtsiz, vaqtsiz[:2])
+    if yuborilgan and not vaqtsiz:
+        ts = int(yuborilgan[0].split("|")[1])
+        hozir = W.clock + 946684800
+        yosh = hozir - ts
+        check("voqea vaqti oflayn davrga tiklandi (hozirgi payt emas)",
+              yosh > 1000,
+              "voqea {:.0f} soniya oldin deb yozildi".format(yosh))
+
     print("\n=== 8. Vaqt SAKRASHI motosoatni buzmasligi ===")
     W.__init__()
     new_device(tmp)
