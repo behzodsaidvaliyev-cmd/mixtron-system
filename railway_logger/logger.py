@@ -1,5 +1,9 @@
 import os
+import hmac
+import shutil
+import socket
 import sqlite3
+import tempfile
 import time
 import json
 import calendar
@@ -555,6 +559,35 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif parsed.path == "/export.db":
+            # Faqat ko'chirish uchun. EXPORT_TOKEN o'rnatilmagan bo'lsa
+            # endpoint umuman yo'qdek javob beradi.
+            token = os.environ.get("EXPORT_TOKEN", "")
+            if not token or not hmac.compare_digest(params.get("token", [""])[0], token):
+                self._send_error(404, "not found")
+                return
+            fd, nusxa = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            try:
+                # backup() yozilayotgan baza'dan ham butun, izchil nusxa oladi
+                dst = sqlite3.connect(nusxa)
+                with db_lock:
+                    # Ochiq (commit qilinmagan) tranzaksiya bo'lsa backup
+                    # cheksiz kutib qoladi - get_conn() dagi 0 qatorli
+                    # UPDATE ham shunday tranzaksiya ochib qoldiradi.
+                    if conn.in_transaction:
+                        conn.commit()
+                    conn.backup(dst)
+                dst.close()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(os.path.getsize(nusxa)))
+                self.end_headers()
+                with open(nusxa, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, 1024 * 1024)
+            finally:
+                os.remove(nusxa)
+
         elif parsed.path == "/latest":
             # Dashboard faqat oxirgi o'lchovni ko'rish uchun butun soatlik
             # /readings.csv ni yuklab olardi. Bu bitta qatorni qaytaradi.
@@ -657,14 +690,53 @@ def jimlik_kuzatuvchisi(conn):
             print("[OGOH] kuzatuvda xato:", e)
 
 
+class DualStackServer(ThreadingHTTPServer):
+    # Railway ichki tarmog'i (*.railway.internal) IPv6 orqali ishlaydi,
+    # tashqi domen esa IPv4. "::" + V6ONLY=0 ikkalasini ham qabul qiladi.
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
 def run_http_server(conn):
-    server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
+    try:
+        server = DualStackServer(("::", HTTP_PORT), Handler)
+    except OSError:
+        server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
     server.db_conn = conn
     print("[HTTP] /today_hours xizmati port", HTTP_PORT, "da ishga tushdi")
     server.serve_forever()
 
 
+def bazani_urug_dan_olish():
+    """Ko'chirish uchun: baza fayli hali yo'q bo'lsa va SEED_URL berilgan
+    bo'lsa, eski servisning /export.db sidan bazani yuklab oladi.
+    Baza allaqachon bor bo'lsa hech narsa qilmaydi - qayta ishga tushganda
+    ustidan yozib yubormaydi."""
+    seed_url = os.environ.get("SEED_URL", "")
+    if not seed_url or os.path.exists(DB_PATH):
+        return
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    qism = DB_PATH + ".part"
+    url = seed_url + ("&" if "?" in seed_url else "?") + urlencode({"token": os.environ.get("SEED_TOKEN", "")})
+    print("[SEED] baza yuklanmoqda...")
+    with urllib.request.urlopen(url, timeout=600) as r, open(qism, "wb") as f:
+        shutil.copyfileobj(r, f, 1024 * 1024)
+    tekshir = sqlite3.connect(qism)
+    natija = tekshir.execute("PRAGMA quick_check").fetchone()[0]
+    soni = tekshir.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+    tekshir.close()
+    if natija != "ok":
+        os.remove(qism)
+        raise RuntimeError("[SEED] yuklangan baza buzuq: " + natija)
+    os.replace(qism, DB_PATH)
+    print("[SEED] tayyor: {} MB, readings = {}".format(os.path.getsize(DB_PATH) // 2**20, soni))
+
+
 def main():
+    bazani_urug_dan_olish()
     conn = get_conn()
 
     http_thread = threading.Thread(target=run_http_server, args=(conn,), daemon=True)
@@ -675,7 +747,9 @@ def main():
 
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-        client_id="railway-mixtron-logger",
+        # Ikki servis bir xil client_id bilan ulansa broker ularni navbatma-navbat
+        # uzib turadi - ko'chirish paytida yangisiga boshqa id beriladi.
+        client_id=os.environ.get("MQTT_CLIENT_ID", "railway-mixtron-logger"),
         userdata={"conn": conn},
     )
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
