@@ -102,6 +102,15 @@ def get_conn():
     conn.execute("UPDATE cycle_events SET device = 'mixtron2' WHERE device IS NULL")
     conn.commit()
 
+    # Indekslarsiz har bir /today_hours, /month_hours, /readings.csv so'rovi
+    # millionlab qatorni boshidan oxirigacha o'qirdi. Dashboard bularni har
+    # 5 soniyada so'ragani uchun CPU doim band bo'lib, Railway hisobi oyiga
+    # $9 ga chiqib ketgan. Birinchi ishga tushishda bir necha soniya oladi.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_device_ts ON readings (device, received_ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_ts ON readings (received_ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_device_ts ON cycle_events (device, event_ts)")
+    conn.commit()
+
     # eski yozuvlarda received_ts bo'sh qolgan - received_at matnidan orqaga qarab to'ldiramiz
     rows = conn.execute("SELECT id, received_at FROM readings WHERE received_ts IS NULL").fetchall()
     for row_id, received_at in rows:
@@ -545,6 +554,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        elif parsed.path == "/latest":
+            # Dashboard faqat oxirgi o'lchovni ko'rish uchun butun soatlik
+            # /readings.csv ni yuklab olardi. Bu bitta qatorni qaytaradi.
+            with db_lock:
+                r = conn.execute(
+                    "SELECT received_ts, status, volt, amp, watt, motosoat, energy, freq, pf FROM readings "
+                    "WHERE device = ? ORDER BY received_ts DESC LIMIT 1",
+                    (device,),
+                ).fetchone()
+            if not r:
+                self._send_error(404, "olchov yoq")
+                return
+            self._send_json({
+                "zavod": device,
+                "received_ts": r[0],
+                "vaqt": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r[0] + UZ_OFFSET)) if r[0] else "",
+                "status": r[1], "volt": r[2], "amp": r[3], "watt": r[4],
+                "motosoat": r[5], "energy": r[6], "freq": r[7], "pf": r[8],
+            })
 
         elif parsed.path == "/holat":
             self._send_json({
