@@ -13,5 +13,5 @@ ENV OPENSSL_CONF=/mosquitto/config/openssl.cnf
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
-EXPOSE 1883 8883
+EXPOSE 1883 8883 8080
 CMD ["/start.sh"]
