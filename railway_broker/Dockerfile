@@ -8,6 +8,8 @@ FROM eclipse-mosquitto:2.0.20
 RUN apk add --no-cache openssl
 
 COPY mosquitto.conf /mosquitto/config/mosquitto.conf
+COPY openssl.cnf /mosquitto/config/openssl.cnf
+ENV OPENSSL_CONF=/mosquitto/config/openssl.cnf
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
