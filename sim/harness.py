@@ -38,6 +38,9 @@ class World:
         self.ntp_works = True
         self.ntp_bad = False          # NTP 2036 aylanishi: 136 yil xato vaqt
         self.broker = "ok"            # ok | down | hang
+        self.broker_hosts = {}        # manzil -> ok | down | hang (ustun turadi)
+        self.connect_attempts = []    # qaysi brokerga ulanishga urinildi
+        self.connected_hosts = []     # qaysi brokerga ulandi
         self.pzem = "ok"              # ok | dead
         self.pzem_current = 9.0
         self.pzem_voltage = 220.0
@@ -377,6 +380,12 @@ class FakeMQTTClient:
     def __init__(self, **kw):
         self.sock = FakeSSLSock()
         self.cb = None
+        self.server = kw.get("server")
+
+    def _state(self):
+        # Har bir broker manzili uchun alohida holat (W.broker_hosts), aks
+        # holda umumiy W.broker ishlatiladi.
+        return W.broker_hosts.get(self.server, W.broker)
 
     def set_callback(self, cb):
         self.cb = cb
@@ -385,14 +394,17 @@ class FakeMQTTClient:
         if not W.wifi_up:
             W.advance(0.3)
             raise OSError("tarmoq yo'q")
-        if W.broker == "down":
+        st = self._state()
+        W.connect_attempts.append(self.server)
+        if st == "down":
             W.advance(0.5)
             raise OSError("broker mavjud emas")
-        if W.broker == "hang":
+        if st == "hang":
             W.advance(15.0)              # socket timeout ishga tushdi
             raise OSError("ETIMEDOUT")
         W.advance(1.2)                   # SSL handshake
         W.mqtt_connects += 1
+        W.connected_hosts.append(self.server)
         self.sock = FakeSSLSock()
 
     def disconnect(self):

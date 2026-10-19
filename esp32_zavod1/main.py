@@ -14,6 +14,8 @@ import os
 import sys
 import select
 import socket
+import struct
+import binascii
 from machine import UART, Pin, WDT
 
 try:
@@ -37,6 +39,17 @@ STATUS_FILE = "last_status.txt"         # reboot'dan keyin soxta voqea yozilmasl
 BOOT_ID_FILE = "boot_id.txt"            # oflayn voqea qaysi yoqilishda yozilganini bilish uchun
 
 MQTT_PORT = 8883
+
+# O'z brokerimiz (Railway, mixtron loyihasi, mixtron-broker servisi),
+# HTTPS domeni orqali WebSocket bilan (pastda WSMQTTClient).
+# 2026-10-19 dan HiveMQ Cloud'ga O'zbekistondan ulanib bo'lmay qoldi. Avval
+# shu broker sinanadi; ketma-ket BROKER_SWITCH_AFTER_FAILS marta ulanmasa
+# mqtt_config.json dagi broker'ga (HiveMQ) o'tiladi va yana navbat bilan.
+# Shunda yangi broker ishlamay qolsa ham qurilma eskisidan yomon bo'lmaydi.
+# Login/parol ikkalasida bir xil - mqtt_config.json dan olinadi.
+OWN_BROKER = "mixtron-broker-production.up.railway.app"   # WebSocket, 443
+OWN_PORT = 443
+BROKER_SWITCH_AFTER_FAILS = 3
 MQTT_KEEPALIVE = 60
 MQTT_TOPIC = DEVICE + "/data"
 MQTT_EVENTS_TOPIC = DEVICE + "/events"
@@ -195,6 +208,7 @@ def net_write_ready(client, timeout_ms=NET_WRITE_TIMEOUT_MS):
     sock = getattr(client, "sock", None)
     if sock is None:
         return False
+    sock = getattr(sock, "raw", sock)     # WebSocket: poll() TLS soketining o'ziga
     try:
         p = select.poll()
         p.register(sock, select.POLLOUT)
@@ -866,20 +880,227 @@ def mqtt_message_callback(topic, msg):
             print("[THRESHOLD] xato:", e)
 
 
+# ---------------------------------------------------------------------------
+# MQTT WebSocket orqali (443) - WS-BLOCK-BEGIN
+# ---------------------------------------------------------------------------
+# NIMA UCHUN: 2026-10-19 sinovlari - O'zbekistondan nostandart portdagi TLS
+# (HiveMQ 8883, Railway TCP proxy) beqaror: ulanish o'rnatilib uzilib turadi,
+# xabarlar qaytmaydi. 443 port (oddiy HTTPS) esa 15/15 ishladi va 3 daqiqalik
+# sinovda bir marta ham uzilmadi. Shu sabab o'z brokerimizga Railway HTTPS
+# domeni orqali WebSocket bilan ulanamiz.
+#
+# QANDAY: umqtt.simple faqat self.sock.write()/read()/setblocking() ni
+# ishlatadi. WSStream shu uchtasini WebSocket ramkalari bilan bajaradi, shuning
+# uchun publish/subscribe/check_msg o'zgarmasdan ishlayveradi.
+
+WS_PATH = b"/mqtt"
+
+
+def _ws_mask(data):
+    mask = os.urandom(4)
+    body = bytearray(data)
+    for i in range(len(body)):
+        body[i] ^= mask[i & 3]
+    return mask, body
+
+
+class WSStream:
+    def __init__(self, tls):
+        self.raw = tls          # net_write_ready() poll() ni shu soketga qiladi
+        self._buf = b""
+        self._nb = False
+
+    def setblocking(self, flag):
+        # TLS soketiga UZATILMAYDI: ESP32'da setblocking(True) vaqt chegarasini
+        # bekor qiladi. Bloklanmaydigan o'qish poll() orqali qilinadi.
+        self._nb = not flag
+
+    def settimeout(self, t):
+        self.raw.settimeout(t)
+
+    def _send(self, data):
+        mv = memoryview(data)
+        while len(mv):
+            n = self.raw.write(mv)
+            if not n:
+                raise OSError("ws: yozib bo'lmadi")
+            mv = mv[n:]
+
+    def _frame_out(self, op, data):
+        if isinstance(data, str):           # umqtt client_id/login'ni str holida yozadi
+            data = data.encode()
+        ln = len(data)
+        if ln < 126:
+            hdr = bytearray((op, 0x80 | ln))
+        else:
+            hdr = bytearray((op, 0xFE, ln >> 8, ln & 0xFF))
+        mask, body = _ws_mask(data)
+        self._send(hdr + mask + body)
+
+    def write(self, data, n=None):
+        if n is not None:
+            data = data[:n]
+        self._frame_out(0x82, data)
+        return len(data)
+
+    def _rx(self, n):
+        out = b""
+        while len(out) < n:
+            b = self.raw.read(n - len(out))
+            if not b:
+                raise OSError("ws: ulanish yopildi")
+            out += b
+        return out
+
+    def _frame_in(self):
+        h = self._rx(2)
+        op = h[0] & 0x0F
+        ln = h[1] & 0x7F
+        if ln == 126:
+            ln = struct.unpack("!H", self._rx(2))[0]
+        elif ln == 127:
+            ln = struct.unpack("!Q", self._rx(8))[0]
+        mask = self._rx(4) if h[1] & 0x80 else None
+        data = self._rx(ln) if ln else b""
+        if mask:
+            data = bytes(bytearray(data[i] ^ mask[i & 3] for i in range(ln)))
+        if op in (0, 1, 2):
+            self._buf += data
+        elif op == 8:
+            raise OSError("ws: server ulanishni yopdi")
+        elif op == 9:
+            self._frame_out(0x8A, data)      # ping -> pong
+
+    def _readable(self):
+        try:
+            p = select.poll()
+            p.register(self.raw, select.POLLIN)
+            return bool(p.poll(0))
+        except Exception:
+            return True
+
+    def read(self, n):
+        if self._nb and not self._buf and not self._readable():
+            return None
+        while len(self._buf) < n:
+            self._frame_in()
+        out = self._buf[:n]
+        self._buf = self._buf[n:]
+        return out
+
+    def close(self):
+        try:
+            self._frame_out(0x88, b"")
+        except Exception:
+            pass
+        self.raw.close()
+
+
+class WSMQTTClient(MQTTClient):
+    """umqtt.simple MQTTClient, faqat ulanish WebSocket (wss://) orqali."""
+
+    def connect(self, clean_session=True, timeout=None):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        raw = socket.socket()
+        raw.settimeout(timeout or SOCKET_TIMEOUT_S)
+        raw.connect(socket.getaddrinfo(self.server, self.port)[0][-1])
+        tls = ssl.wrap_socket(raw, server_hostname=self.server, cert_reqs=ssl.CERT_NONE)
+        host = self.server.encode() if isinstance(self.server, str) else self.server
+        key = binascii.b2a_base64(os.urandom(16)).strip()
+        ws = WSStream(tls)
+        ws._send(b"GET " + WS_PATH + b" HTTP/1.1\r\nHost: " + host +
+                 b"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                 b"Sec-WebSocket-Key: " + key +
+                 b"\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n")
+        resp = b""
+        while not resp.endswith(b"\r\n\r\n"):
+            resp += ws._rx(1)
+            if len(resp) > 2048:
+                break
+        if b" 101 " not in resp.split(b"\r\n", 1)[0]:
+            tls.close()
+            raise OSError("ws: upgrade rad etildi: " + resp.split(b"\r\n", 1)[0].decode())
+        self.sock = ws
+        # Quyidagi - umqtt.simple connect() dagi CONNECT paketi (o'zgarishsiz).
+        premsg = bytearray(b"\x10\0\0\0\0\0")
+        msg = bytearray(b"\x04MQTT\x04\x02\0\0")
+        sz = 10 + 2 + len(self.client_id)
+        msg[6] = clean_session << 1
+        if self.user:
+            sz += 2 + len(self.user) + 2 + len(self.pswd)
+            msg[6] |= 0xC0
+        if self.keepalive:
+            msg[7] |= self.keepalive >> 8
+            msg[8] |= self.keepalive & 0x00FF
+        i = 1
+        while sz > 0x7F:
+            premsg[i] = (sz & 0x7F) | 0x80
+            sz >>= 7
+            i += 1
+        premsg[i] = sz
+        self.sock.write(premsg, i + 2)
+        self.sock.write(msg)
+        self._send_str(self.client_id)
+        if self.user:
+            self._send_str(self.user)
+            self._send_str(self.pswd)
+        resp = self.sock.read(4)
+        if resp and len(resp) > 3 and resp[0] == 0x20 and resp[1] == 0x02 and not resp[3]:
+            return resp[2] & 1
+        raise OSError("mqtt: CONNACK rad etildi: " + str(resp))
+# WS-BLOCK-END
+
+
+_broker_idx = 0         # 0 - o'z brokerimiz, 1 - mqtt_config.json dagisi
+_broker_fails = 0
+
+
 def mqtt_connect():
+    global _broker_idx, _broker_fails
     if not CONFIG_OK:
         raise RuntimeError("mqtt_config.json yo'q/buzuq - MQTT ishlamaydi")
+    brokers = ((OWN_BROKER, OWN_PORT), (MQTT_BROKER, MQTT_PORT))
+    host, port = brokers[_broker_idx]
+    try:
+        client = _mqtt_connect_to(host, port)
+    except Exception:
+        _broker_fails += 1
+        if _broker_fails >= BROKER_SWITCH_AFTER_FAILS:
+            _broker_fails = 0
+            _broker_idx = 1 - _broker_idx
+            print("[MQTT] boshqa brokerga o'tiladi:", brokers[_broker_idx][0])
+        raise
+    _broker_fails = 0
+    return client
+
+
+def _mqtt_connect_to(host, port):
     gc.collect()  # SSL handshake uchun maksimal bo'sh xotira
-    client = MQTTClient(
-        client_id=MQTT_CLIENT_ID,
-        server=MQTT_BROKER,
-        port=MQTT_PORT,
-        user=MQTT_USER,
-        password=MQTT_PASSWORD,
-        keepalive=MQTT_KEEPALIVE,
-        ssl=True,
-        ssl_params={"server_hostname": MQTT_BROKER, "cert_reqs": ssl.CERT_NONE},
-    )
+    if host == OWN_BROKER:
+        client = WSMQTTClient(
+            client_id=MQTT_CLIENT_ID,
+            server=host,
+            port=port,
+            user=MQTT_USER,
+            password=MQTT_PASSWORD,
+            keepalive=MQTT_KEEPALIVE,
+        )
+    else:
+        client = MQTTClient(
+            client_id=MQTT_CLIENT_ID,
+            server=host,
+            port=port,
+            user=MQTT_USER,
+            password=MQTT_PASSWORD,
+            keepalive=MQTT_KEEPALIVE,
+            ssl=True,
+            ssl_params={"server_hostname": host, "cert_reqs": ssl.CERT_NONE},
+        )
     client.set_callback(mqtt_message_callback)
     # Ulanish (TCP + SSL) bosqichiga aniq vaqt chegarasi. Yangi umqtt
     # kutubxonalari buni qo'llab-quvvatlaydi; eskilarida bu parametr yo'q,
@@ -891,7 +1112,7 @@ def mqtt_connect():
     restore_socket_timeout(client)      # o'rnatilgan ulanishga chegara qo'yiladi
     client.subscribe(MQTT_COMMAND_TOPIC)
     restore_socket_timeout(client)
-    print("[MQTT] ulandi:", MQTT_BROKER)
+    print("[MQTT] ulandi:", host)
     return client
 
 

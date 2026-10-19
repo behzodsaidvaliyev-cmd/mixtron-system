@@ -69,7 +69,9 @@ def boot(run_seconds):
     W.powered = True
     out = "tugadi"
     try:
-        importlib.import_module("main").main()
+        _m = importlib.import_module("main")
+        _m.WSMQTTClient = _m.MQTTClient      # WebSocket - taqlid mijoz bilan
+        _m.main()
     except SimEnd:
         out = "tugadi"
     except DeviceReset:

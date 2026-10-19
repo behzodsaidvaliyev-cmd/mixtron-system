@@ -49,6 +49,9 @@ def boot(run_seconds, expect_reset=False):
     outcome = "tugadi"
     try:
         main = importlib.import_module("main")
+        # WebSocket transporti sim/ws_real_test.py bilan REAL brokerga qarshi
+        # sinaladi; bu yerda esa u ham taqlid qilingan MQTT mijozi bilan almashtiriladi.
+        main.WSMQTTClient = main.MQTTClient
         main.main()
     except SimEnd:
         outcome = "tugadi"
@@ -377,6 +380,46 @@ def run_all():
           boots[0] if boots else "yo'q")
 
     # =====================================================================
+    # =====================================================================
+    print("\n=== 15. O'z brokerimiz ishlaydi - HiveMQ'ga umuman borilmaydi ===")
+    W.__init__()
+    new_device(tmp)
+    own = "mixtron-broker-production.up.railway.app"
+    W.broker_hosts = {"b.hivemq.cloud": "hang"}     # HiveMQ O'zbekistondan yopiq
+    out = boot(120)
+    check("o'z brokerimizga ulandi", own in W.connected_hosts, str(W.connected_hosts[:3]))
+    check("HiveMQ'ga urinilmadi", "b.hivemq.cloud" not in W.connect_attempts)
+    check("ma'lumot yuborildi", len(data_lines()) > 15, "{} ta".format(len(data_lines())))
+    check("WDT ishga tushmadi", "WDT" not in out, out)
+
+    # =====================================================================
+    print("\n=== 16. O'z brokerimiz yiqilgan - HiveMQ'ga o'tadi ===")
+    W.__init__()
+    new_device(tmp)
+    W.broker_hosts = {own: "down"}
+    out = boot(180)
+    check("avval o'z brokerimiz sinaldi", W.connect_attempts[:1] == [own], str(W.connect_attempts[:4]))
+    check("keyin HiveMQ'ga ulandi", "b.hivemq.cloud" in W.connected_hosts, str(W.connected_hosts[:3]))
+    check("ma'lumot yuborildi (HiveMQ orqali)", len(data_lines()) > 10, "{} ta".format(len(data_lines())))
+    check("WDT ishga tushmadi", "WDT" not in out, out)
+
+    # =====================================================================
+    print("\n=== 17. Ikkalasi ham QOTADI (hang) - qurilma qayta yuklanmaydi ===")
+    W.__init__()
+    new_device(tmp)
+    W.broker = "hang"
+    out = boot(900)
+    check("qayta yuklanish/WDT yo'q", out == "tugadi", out)
+    check("ikkala broker ham navbat bilan sinaldi",
+          own in W.connect_attempts and "b.hivemq.cloud" in W.connect_attempts)
+    check("WDT oralig'i chegaradan ancha past", W.wdt_max_gap < 60, "{:.1f}s".format(W.wdt_max_gap))
+    print("    ... o'z brokerimiz tiklandi ...")
+    W.broker = "ok"
+    before = len(W.published)
+    out = boot(180)
+    d17 = [p for t, p in W.published[before:] if t.endswith("/data")]
+    check("tiklangach ma'lumot ketdi", len(d17) > 10, "{} ta".format(len(d17)))
+
     print("\n" + "=" * 62)
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)
