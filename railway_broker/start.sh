@@ -19,6 +19,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
 
 rm -f "$RUN_DIR/passwd"
 touch "$RUN_DIR/passwd"
+chmod 0600 "$RUN_DIR/passwd"
 mosquitto_passwd -b "$RUN_DIR/passwd" "$MQTT_USER" "$MQTT_PASSWORD"
 
 chown -R mosquitto:mosquitto "$RUN_DIR"
