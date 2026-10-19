@@ -980,8 +980,15 @@ class WSStream:
             return True
 
     def read(self, n):
-        if self._nb and not self._buf and not self._readable():
-            return None
+        if self._nb and not self._buf:
+            if not self._readable():
+                return None
+            # Kelgan ramka ping/pong bo'lishi mumkin - unda MQTT ma'lumoti yo'q.
+            # Keyingisini kutib qolmaymiz: aks holda 15 s timeout -> xato ->
+            # ulanish yopiladi (2026-10-19: har ~5 daqiqada shunday bo'lgan).
+            self._frame_in()
+            if not self._buf:
+                return None
         while len(self._buf) < n:
             self._frame_in()
         out = self._buf[:n]
