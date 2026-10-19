@@ -207,7 +207,7 @@ def get_conn():
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    print("[MQTT] connected, rc =", rc)
+    print("[MQTT] connected ({}), rc =".format(userdata.get("broker")), rc)
     client.subscribe(DATA_TOPIC_FILTER)
     client.subscribe(EVENTS_TOPIC_FILTER)
 
@@ -745,24 +745,42 @@ def main():
     ogoh_thread = threading.Thread(target=jimlik_kuzatuvchisi, args=(conn,), daemon=True)
     ogoh_thread.start()
 
+    # Ikkinchi broker (o'zimizning mixtron-broker, ichki tarmoq). Qurilmalar
+    # ulardan biriga yuboradi - avval o'zimiznikiga, u ishlamasa HiveMQ'ga -
+    # shuning uchun logger ikkalasini birdan tinglaydi. Bir xabar ikki
+    # brokerga tushmaydi, demak takroriy yozuv bo'lmaydi.
+    broker2 = os.environ.get("MQTT_BROKER2", "")
+    if broker2:
+        threading.Thread(
+            target=mqtt_tsikli,
+            args=(conn, broker2, int(os.environ.get("MQTT_PORT2", "1883")),
+                  os.environ.get("MQTT_TLS2", "0") == "1", "-2"),
+            daemon=True,
+        ).start()
+
+    mqtt_tsikli(conn, MQTT_BROKER, MQTT_PORT, True, "")
+
+
+def mqtt_tsikli(conn, broker, port, tls, qoshimcha):
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         # Ikki servis bir xil client_id bilan ulansa broker ularni navbatma-navbat
         # uzib turadi - ko'chirish paytida yangisiga boshqa id beriladi.
-        client_id=os.environ.get("MQTT_CLIENT_ID", "railway-mixtron-logger"),
-        userdata={"conn": conn},
+        client_id=os.environ.get("MQTT_CLIENT_ID", "railway-mixtron-logger") + qoshimcha,
+        userdata={"conn": conn, "broker": broker},
     )
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-    client.tls_set()
+    if tls:
+        client.tls_set()
     client.on_connect = on_connect
     client.on_message = on_message
 
     while True:
         try:
-            client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            client.connect(broker, port, 60)
             client.loop_forever()
         except Exception as e:
-            print("[MQTT] connection error:", e)
+            print("[MQTT] connection error ({}):".format(broker), e)
             time.sleep(5)
 
 
