@@ -1536,10 +1536,10 @@ def main():
     # Yoqilish xabari: Railway'da ko'rinadi. Qurilma tez-tez qayta yuklanayotgan
     # bo'lsa (nosozlik alomati) buni darhol payqash mumkin - avval uch qurilma
     # 6 kun jim turgani sezilmay qolgan edi.
-    # rc = machine.reset_cause(): 1 = quvvat yoqildi / kuchlanish tushdi
-    # (brownout), 3 = WDT (kod qotgan), 5 = dastur o'zi qayta yukladi
-    # (xato, OTA, REBOOT buyrug'i), 2 = EN tugmasi. zavod1 2026-10-21 da
-    # 3 marta qayta yuklangan - sababini aniqlab bo'lmagan edi.
+    # rc = machine.reset_cause(): 1 = quvvat yoqildi / kuchlanish tushdi,
+    # 2 = dastur o'zi qayta yukladi - machine.reset() (OTA, REBOOT buyrug'i,
+    # xato; zavod3 OTA'sida 2026-10-22 kuzatilgan), 3 = WDT (kod qotgan).
+    # zavod1 2026-10-21 da 3 marta qayta yuklangan - sababi noma'lum edi.
     try:
         rc = machine.reset_cause()
     except Exception:

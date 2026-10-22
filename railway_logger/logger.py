@@ -271,7 +271,11 @@ def on_message(client, userdata, msg):
                     (device, event_ts, event_time_local, event_type, float(motosoat)),
                 )
                 conn.commit()
-            print("[EVENT] saved ({}): {} at {} (mahalliy vaqt) motosoat = {}".format(device, event_type, event_time_local, motosoat))
+            # Qo'shimcha maydonlar (masalan BOOT uchun "rc=3" - qayta yuklanish
+            # sababi: 1 quvvat/brownout, 2 dastur o'zi (machine.reset), 3 WDT) faqat logda ko'rinadi.
+            print("[EVENT] saved ({}): {} at {} (mahalliy vaqt) motosoat = {}{}".format(
+                device, event_type, event_time_local, motosoat,
+                " " + " ".join(parts[4:]) if len(parts) > 4 else ""))
             if event_type in ("ON", "OFF"):          # BOOT - qurilma yoqilgani, drobilka ishi emas
                 kanalga_yubor(holat_xabari(conn, device, event_type, event_ts, now))
         except Exception as e:
