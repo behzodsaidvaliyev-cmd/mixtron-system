@@ -727,7 +727,10 @@ def telegram_rasm(png, izoh, chat_id):
         return False
     chegara = "----mixtron" + str(int(time.time() * 1000))
     qismlar = []
-    for nom, qiymat in (("chat_id", str(chat_id)), ("caption", izoh)):
+    maydonlar = [("chat_id", str(chat_id))]
+    if izoh:
+        maydonlar.append(("caption", izoh))
+    for nom, qiymat in maydonlar:
         qismlar.append(('--{}\r\nContent-Disposition: form-data; name="{}"\r\n\r\n{}\r\n'
                         .format(chegara, nom, qiymat)).encode("utf-8"))
     qismlar.append(('--{}\r\nContent-Disposition: form-data; name="photo"; filename="hisobot.png"\r\n'
@@ -772,8 +775,9 @@ def hisobot_kuzatuvchisi(conn):
             if bor:
                 continue
             oxirgi_urinish = hozir
-            png, izoh = kunlik_hisobot(conn, sana)
-            if telegram_rasm(png, izoh, TELEGRAM_CHANNEL_ID):
+            png, _ = kunlik_hisobot(conn, sana)
+            # rasm matnsiz yuboriladi - foydalanuvchi so'rovi (hamma narsa rasmda)
+            if telegram_rasm(png, "", TELEGRAM_CHANNEL_ID):
                 with db_lock:
                     conn.execute("INSERT OR REPLACE INTO hisobot_yuborilgan VALUES (?, ?)", (sana, int(hozir)))
                     conn.commit()

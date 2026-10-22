@@ -6,9 +6,9 @@ mumkin - yuborishdan oldin tekshirish uchun.
 
 Ma'lumot manbalari:
 - ishlagan soat - motosoat farqi (boshqa hisobotlar bilan bir xil son);
-- yondi soni, birinchi yonish, oxirgi o'chish, vaqt chizig'i, eng uzun
-  uzluksiz ish, aloqa uzilishi - readings'dagi
-  jonli Status (~6 soniyada bir o'lchov), daqiqalik bo'laklarga yig'ib.
+- vaqt chizig'i va undagi yonish/o'chish vaqtlari - readings'dagi jonli
+  Status (~6 soniyada bir o'lchov), daqiqalik bo'laklarga yig'ib; o'lchov
+  kelmagan oraliqlar motosoat o'sishi bo'yicha to'ldiriladi.
 """
 import io
 import os
@@ -17,7 +17,6 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 UZ_OFFSET = 5 * 3600
-JIM_CHEGARA_DAQ = 10        # shundan uzun bo'shliq = aloqa uzilishi (Telegram ogohlantirishi bilan bir xil)
 
 _FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
@@ -35,7 +34,6 @@ XIRA = (140, 154, 170)
 YASHIL = (46, 204, 113)
 QIZIL = (231, 76, 60)
 KULRANG = (78, 90, 106)
-SARIQ = (241, 196, 15)
 CHIZIQ = (55, 66, 82)
 
 
@@ -44,48 +42,59 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
     kun_oxiri = kun_boshi + 86400
     with lock:
         rows = conn.execute(
-            "SELECT received_ts, status FROM readings "
+            "SELECT received_ts, status, motosoat FROM readings "
             "WHERE device = ? AND received_ts >= ? AND received_ts < ? ORDER BY received_ts",
             (device, kun_boshi, kun_oxiri),
         ).fetchall()
+        oldingi_row = conn.execute(
+            "SELECT motosoat FROM readings WHERE device = ? AND received_ts < ? "
+            "ORDER BY received_ts DESC LIMIT 1",
+            (device, kun_boshi),
+        ).fetchone()
 
-    # Daqiqalik holat: 1 = ishladi, 0 = to'xtagan, None = o'lchov yo'q
+    # Daqiqalik holat: 1 = ishladi, 0 = to'xtagan, None = o'lchov yo'q.
+    # mot_oxiri[i] - shu daqiqadagi oxirgi motosoat, mot_boshi[i] - birinchisi.
     daq = [None] * 1440
-    for ts, st in rows:
+    mot_boshi = [None] * 1440
+    mot_oxiri = [None] * 1440
+    for ts, st, mot in rows:
         i = int((ts - kun_boshi) // 60)
         if 0 <= i < 1440:
             if st == "ON":
                 daq[i] = 1
             elif daq[i] is None:
                 daq[i] = 0
+            if mot_boshi[i] is None:
+                mot_boshi[i] = mot
+            mot_oxiri[i] = mot
 
-    # Qisqa bo'shliqlar (qayta ulanish, bir necha soniya) oldingi holat bilan
-    # to'ldiriladi; JIM_CHEGARA_DAQ dan uzunlari - aloqa uzilishi.
+    # O'lchov kelmagan daqiqalar (aloqa uzilishi, qayta ulanish) MOTOSOAT
+    # bo'yicha to'ldiriladi: ESP32 motosoatni aloqasiz ham hisoblab turadi.
+    # Bo'shliq davomida motosoat bo'shliq uzunligining kamida yarmicha
+    # o'sgan bo'lsa - zavod ishlagan, aks holda to'xtagan. Chegaralardan
+    # biri yo'q bo'lsa (kun boshi/oxiri) - qo'shni holat olinadi.
+    hozir_daq = int((time.time() - kun_boshi) // 60)
+    oxirgi = min(1440, max(hozir_daq, 0))       # bugungi kunning kelajagi bo'yalmaydi
     holat = list(daq)
     i = 0
-    while i < 1440:
-        if holat[i] is None:
-            j = i
-            while j < 1440 and holat[j] is None:
-                j += 1
-            uzunlik = j - i
-            if uzunlik >= JIM_CHEGARA_DAQ:
-                for k in range(i, j):
-                    holat[k] = "jim"
-            else:
-                oldingi = holat[i - 1] if i > 0 and holat[i - 1] in (0, 1) else 0
-                for k in range(i, j):
-                    holat[k] = oldingi
-            i = j
-        else:
+    while i < oxirgi:
+        if holat[i] is not None:
             i += 1
-
-    # Bugungi kun hali tugamagan bo'lsa, kelajak daqiqalari "jim" emas
-    hozir_daq = int((time.time() - kun_boshi) // 60)
-    if hozir_daq < 1440:
-        for k in range(max(hozir_daq, 0), 1440):
-            if holat[k] == "jim":
-                holat[k] = None
+            continue
+        j = i
+        while j < oxirgi and holat[j] is None:
+            j += 1
+        oldin = mot_oxiri[i - 1] if i > 0 else (oldingi_row[0] if oldingi_row else None)
+        keyin = mot_boshi[j] if j < 1440 else None
+        if oldin is not None and keyin is not None:
+            qiymat = 1 if (keyin - oldin) * 60 >= 0.5 * (j - i) else 0
+        elif i > 0:
+            qiymat = holat[i - 1]
+        else:
+            qiymat = holat[j] if j < 1440 and holat[j] is not None else 0
+        for k in range(i, j):
+            holat[k] = qiymat
+        i = j
 
     return {
         "zavod": device,
@@ -104,8 +113,6 @@ def _belgilar(holat):
     Vaqt chizig'idan olinadi, cycle_events dan emas: qurilma qayta
     yuklanganda (BOOT) soniyalik soxta OFF/ON voqealari yoziladi -
     2026-10-21 zavod1 da "o'chish 18:38" aslida qayta yuklanish edi.
-    Faqat ishladi <-> to'xtagan chegaralari olinadi; aloqa uzilishi
-    ("jim") chegarasi emas - u paytda zavod nima qilgani noma'lum.
     QISQA_TOXTASH_DAQ dan qisqa to'xtashning ikkala chegarasi ham yozilmaydi."""
     bolaklar = []                      # (boshi, oxiri, holat)
     i = 0
@@ -191,7 +198,7 @@ def rasm_chizish(statlar, sana_matn):
 
     # rang izohi
     lx, ly = pad, 156
-    for rang, nom in ((YASHIL, "ishladi"), (KULRANG, "to'xtagan"), (SARIQ, "aloqa yo'q")):
+    for rang, nom in ((YASHIL, "ishladi"), (KULRANG, "to'xtagan")):
         d.rounded_rectangle((lx, ly + 4, lx + 22, ly + 22), radius=4, fill=rang)
         d.text((lx + 32, ly), nom, font=f_belgi, fill=XIRA)
         lx += 50 + d.textlength(nom, font=f_belgi)
@@ -224,7 +231,7 @@ def rasm_chizish(statlar, sana_matn):
             j = i
             while j < 1440 and holat[j] == h:
                 j += 1
-            rang = {1: YASHIL, 0: KULRANG, "jim": SARIQ}.get(h)
+            rang = {1: YASHIL, 0: KULRANG}.get(h)
             if rang:
                 d.rectangle((x_of(i), ty0, x_of(j), ty1), fill=rang)
             i = j
