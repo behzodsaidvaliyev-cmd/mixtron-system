@@ -53,6 +53,10 @@ SILENCE_CHECK_S = int(os.environ.get("SILENCE_CHECK_S", "60"))    # tekshirish o
 SILENCE_FORGET_S = 7 * 86400        # shuncha vaqt ko'rinmagan qurilma kuzatilmaydi
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# "MIXTRON ZAVOD HOLATI" kanali: zavod yondi/o'chdi va aloqa uzilishi xabarlari.
+# Shaxsiy chatga (TELEGRAM_CHAT_ID) jimlik ogohlantirishlari eskidek boradi.
+TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+KECHIKKAN_VOQEA_S = 300     # voqea bundan kech kelsa "kechikib keldi" deb belgilanadi
 
 # RLock (oddiy Lock emas): qulf olgan funksiya ichidan yana qulf
 # oladigan funksiya chaqirilsa, oddiy Lock butun xizmatni abadiy
@@ -259,6 +263,8 @@ def on_message(client, userdata, msg):
                 )
                 conn.commit()
             print("[EVENT] saved ({}): {} at {} (mahalliy vaqt) motosoat = {}".format(device, event_type, event_time_local, motosoat))
+            if event_type in ("ON", "OFF"):          # BOOT - qurilma yoqilgani, drobilka ishi emas
+                kanalga_yubor(holat_xabari(conn, device, event_type, event_ts, now))
         except Exception as e:
             print("[EVENT] parse/save error:", e, "line:", line)
 
@@ -621,21 +627,55 @@ class Handler(BaseHTTPRequestHandler):
         pass  # standart konsolni shovqindan tozalash
 
 
-def telegram_yubor(matn):
+def telegram_yubor(matn, chat_id=None):
     """Xabar Telegramga yuboriladi. Sozlanmagan bo'lsa xizmat baribir ishlaydi -
     xabar faqat jurnalga tushadi, shunda sozlashdan oldin sinab ko'rish mumkin."""
-    print("[OGOH]", matn.replace(chr(10), " | "))
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    print("[OGOH]" if chat_id == TELEGRAM_CHAT_ID else "[KANAL]", matn.replace(chr(10), " | "))
+    if not (TELEGRAM_TOKEN and chat_id):
         return False
     try:
         url = "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN)
-        data = urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": matn}).encode("utf-8")
+        data = urlencode({"chat_id": chat_id, "text": matn}).encode("utf-8")
         with urllib.request.urlopen(url, data=data, timeout=15) as r:
             r.read()
         return True
     except Exception as e:
         print("[OGOH] Telegramga yuborilmadi:", e)
         return False
+
+
+def kanalga_yubor(matn):
+    """Kanalga ALOHIDA oqimda yuboradi: Telegram sekin javob bersa ham MQTT
+    xabarlarini qabul qilish va bazaga yozish to'xtab qolmasin."""
+    if not TELEGRAM_CHANNEL_ID:
+        return
+    threading.Thread(target=telegram_yubor, args=(matn, TELEGRAM_CHANNEL_ID), daemon=True).start()
+
+
+def zavod_nomi(device):
+    """zavod2 -> Zavod 2"""
+    if device.startswith("zavod") and device[5:].isdigit():
+        return "Zavod " + device[5:]
+    return device
+
+
+def holat_xabari(conn, device, event_type, event_ts, hozir):
+    belgi, soz = ("🟢", "YONDI") if event_type == "ON" else ("🔴", "O'CHDI")
+    vaqt = time.gmtime(event_ts + UZ_OFFSET)
+    bugun = time.gmtime(hozir + UZ_OFFSET)
+    if vaqt[:3] == bugun[:3]:
+        soat = time.strftime("%H:%M", vaqt)
+    else:
+        soat = time.strftime("%d.%m %H:%M", vaqt)
+    qatorlar = ["{} {} — {}".format(belgi, zavod_nomi(device), soz), "🕐 " + soat]
+    try:
+        qatorlar.append("Bugun ishlagan: {:.1f} soat".format(compute_hours_today(conn, device)))
+    except Exception as e:
+        print("[KANAL] bugungi soat hisoblanmadi:", e)
+    if hozir - event_ts > KECHIKKAN_VOQEA_S:
+        qatorlar.append("⏳ kechikib keldi (aloqa uzilgan edi)")
+    return chr(10).join(qatorlar)
 
 
 def jimlik_holati(conn, hozir=None):
@@ -683,9 +723,14 @@ def jimlik_kuzatuvchisi(conn):
                         "⚠ {} - {} daqiqadan beri ma'lumot yo'q".format(
                             zavod, h["jim_daqiqa"])
                         + chr(10) + "Oxirgi ma'lumot: " + h["oxirgi"])
+                    kanalga_yubor(
+                        "🟡 {} — {} daqiqadan beri svet yo'q yoki internet uzilgan".format(
+                            zavod_nomi(zavod), h["jim_daqiqa"])
+                        + chr(10) + "Oxirgi ma'lumot: " + h["oxirgi"][11:16])
                 elif (not h["jim"]) and oldin:
                     _jim_belgilangan[zavod] = False
                     telegram_yubor("✅ {} - aloqa tiklandi".format(zavod))
+                    kanalga_yubor("✅ {} — aloqa tiklandi".format(zavod_nomi(zavod)))
         except Exception as e:
             print("[OGOH] kuzatuvda xato:", e)
 
