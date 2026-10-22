@@ -33,6 +33,7 @@ KARTA = (34, 42, 54)
 MATN = (236, 240, 244)
 XIRA = (140, 154, 170)
 YASHIL = (46, 204, 113)
+QIZIL = (231, 76, 60)
 KULRANG = (78, 90, 106)
 SARIQ = (241, 196, 15)
 CHIZIQ = (55, 66, 82)
@@ -61,7 +62,6 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
     # Qisqa bo'shliqlar (qayta ulanish, bir necha soniya) oldingi holat bilan
     # to'ldiriladi; JIM_CHEGARA_DAQ dan uzunlari - aloqa uzilishi.
     holat = list(daq)
-    jim_daq = 0
     i = 0
     while i < 1440:
         if holat[i] is None:
@@ -72,7 +72,6 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
             if uzunlik >= JIM_CHEGARA_DAQ:
                 for k in range(i, j):
                     holat[k] = "jim"
-                jim_daq += uzunlik
             else:
                 oldingi = holat[i - 1] if i > 0 and holat[i - 1] in (0, 1) else 0
                 for k in range(i, j):
@@ -87,59 +86,90 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
         for k in range(max(hozir_daq, 0), 1440):
             if holat[k] == "jim":
                 holat[k] = None
-                jim_daq -= 1
 
-    eng_uzun = joriy = 0
-    for h in holat:
-        joriy = joriy + 1 if h == 1 else 0
-        eng_uzun = max(eng_uzun, joriy)
-
-    # Yonish/o'chish vaqt chizig'idan olinadi, cycle_events dan emas: qurilma
-    # qayta yuklanganda (BOOT) soniyalik soxta OFF/ON voqealari yoziladi -
-    # 2026-10-21 zavod1 da "oxirgi o'chish 18:38" aslida qayta yuklanish edi.
-    on_lar, off_lar = [], []
-    for k in range(1, 1440):
-        # aloqa uzilishi ("jim") chegarasi yonish/o'chish hisoblanmaydi -
-        # u paytda zavod nima qilgani noma'lum
-        if holat[k] == 1 and holat[k - 1] == 0:
-            on_lar.append(kun_boshi + k * 60)
-        elif holat[k] == 0 and holat[k - 1] == 1:
-            off_lar.append(kun_boshi + k * 60)
     return {
         "zavod": device,
         "soat": hours_fn(device, kun_boshi, kun_oxiri),
-        "yonish_soni": len(on_lar),
-        "birinchi_yonish": _hm(on_lar[0]) if on_lar else "—",
-        "oxirgi_ochish": _hm(off_lar[-1]) if off_lar else "—",
-        "eng_uzun_daq": eng_uzun,
-        "jim_daq": max(jim_daq, 0),
+        "belgilar": _belgilar(holat),
         "holat": holat,
     }
+
+
+QISQA_TOXTASH_DAQ = 5       # bundan qisqa to'xtash chiziqda ko'rinadi, lekin vaqti yozilmaydi
+
+
+def _belgilar(holat):
+    """Chiziqqa yoziladigan yonish/o'chish vaqtlari: [(daqiqa, "ON"/"OFF")].
+
+    Vaqt chizig'idan olinadi, cycle_events dan emas: qurilma qayta
+    yuklanganda (BOOT) soniyalik soxta OFF/ON voqealari yoziladi -
+    2026-10-21 zavod1 da "o'chish 18:38" aslida qayta yuklanish edi.
+    Faqat ishladi <-> to'xtagan chegaralari olinadi; aloqa uzilishi
+    ("jim") chegarasi emas - u paytda zavod nima qilgani noma'lum.
+    QISQA_TOXTASH_DAQ dan qisqa to'xtashning ikkala chegarasi ham yozilmaydi."""
+    bolaklar = []                      # (boshi, oxiri, holat)
+    i = 0
+    while i < 1440:
+        j = i
+        while j < 1440 and holat[j] == holat[i]:
+            j += 1
+        bolaklar.append((i, j, holat[i]))
+        i = j
+    natija = []
+    for k in range(1, len(bolaklar)):
+        oldin, hozir = bolaklar[k - 1], bolaklar[k]
+        if oldin[2] == 0 and hozir[2] == 1:
+            toxtash = oldin[1] - oldin[0]
+            if toxtash >= QISQA_TOXTASH_DAQ or oldin[0] == 0:
+                natija.append((hozir[0], "ON"))
+        elif oldin[2] == 1 and hozir[2] == 0:
+            toxtash = hozir[1] - hozir[0]
+            # kun oxirigacha (yoki hozirgacha) davom etayotgan to'xtash ham yoziladi
+            if toxtash >= QISQA_TOXTASH_DAQ or hozir[1] == 1440 or (k + 1 < len(bolaklar) and bolaklar[k + 1][2] is None):
+                natija.append((hozir[0], "OFF"))
+    return natija
+
+
+def soat_daqiqa(soat):
+    """22.2 -> '22:12' (ishlagan vaqt hamma Telegram xabarlarida shu formatda)."""
+    jami_daq = int(round(soat * 60))
+    return "{}:{:02d}".format(jami_daq // 60, jami_daq % 60)
 
 
 def _hm(ts):
     return time.strftime("%H:%M", time.gmtime(ts + UZ_OFFSET))
 
 
-def _davomiylik(daq):
-    s, m = divmod(int(daq), 60)
-    if s and m:
-        return "{} soat {} daq".format(s, m)
-    if s:
-        return "{} soat".format(s)
-    return "{} daq".format(m)
-
-
 def _zavod_nomi(device):
     return "Zavod " + device[5:] if device.startswith("zavod") else device
+
+
+QATORLAR = 3                # vaqt yozuvlari uchun qatorlar soni (chiziq ustida)
+
+
+def _belgi_joylash(d, belgilar, x_of, font, chap, ong):
+    """Vaqt yozuvlarini qatorlarga taqsimlaydi: yaqin turgan yozuvlar
+    ustma-ust tushmasin. [(x_markaz, matn, rang, qator, x_chiziq)] qaytaradi.
+    Har yozuv eng pastki bo'sh qatorga tushadi (chiziqqa eng yaqin)."""
+    joy = []
+    band = [-1e9] * QATORLAR            # har qatorda oxirgi yozuvning o'ng cheti
+    for daq, tur in belgilar:
+        matn = "{:02d}:{:02d}".format(daq // 60, daq % 60)
+        w = d.textlength(matn, font=font)
+        x = min(max(x_of(daq), chap + w / 2), ong - w / 2)
+        qator = next((q for q in range(QATORLAR) if x - w / 2 > band[q] + 10),
+                     min(range(QATORLAR), key=lambda q: band[q]))
+        band[qator] = x + w / 2
+        joy.append((x, matn, YASHIL if tur == "ON" else QIZIL, qator, x_of(daq)))
+    return joy
 
 
 def rasm_chizish(statlar, sana_matn):
     """statlar - kun_statistikasi() natijalari ro'yxati. PNG bayt qaytaradi."""
     W = 1080
     pad = 48
-    karta_h = 300
-    H = 250 + len(statlar) * (karta_h + 28) + 90
+    karta_h = 270
+    H = 230 + len(statlar) * (karta_h + 26) + 20
     img = Image.new("RGB", (W, H), FON)
     d = ImageDraw.Draw(img)
 
@@ -149,42 +179,46 @@ def rasm_chizish(statlar, sana_matn):
     f_nom = _font(34, True)
     f_qiymat = _font(26, True)
     f_belgi = _font(20)
+    f_vaqt = _font(21, True)
 
     d.text((pad, 40), "MIXTRON", font=f_sarlavha, fill=YASHIL)
     d.text((pad + d.textlength("MIXTRON ", font=f_sarlavha), 40), "kunlik hisobot",
            font=f_sarlavha, fill=MATN)
     d.text((pad, 104), sana_matn, font=f_kichik, fill=XIRA)
 
-    jami = sum(s["soat"] for s in statlar)
-    jt = "Jami: {:.1f} soat".format(jami)
+    jt = "Jami: " + soat_daqiqa(sum(s["soat"] for s in statlar))
     d.text((W - pad - d.textlength(jt, font=f_qiymat), 108), jt, font=f_qiymat, fill=MATN)
 
     # rang izohi
-    lx, ly = pad, 160
+    lx, ly = pad, 156
     for rang, nom in ((YASHIL, "ishladi"), (KULRANG, "to'xtagan"), (SARIQ, "aloqa yo'q")):
         d.rounded_rectangle((lx, ly + 4, lx + 22, ly + 22), radius=4, fill=rang)
         d.text((lx + 32, ly), nom, font=f_belgi, fill=XIRA)
         lx += 50 + d.textlength(nom, font=f_belgi)
+    for rang, nom in ((YASHIL, "yondi"), (QIZIL, "o'chdi")):
+        d.text((lx, ly - 1), nom, font=f_vaqt, fill=rang)
+        lx += 30 + d.textlength(nom, font=f_vaqt)
 
-    y = 210
+    y = 206
     for s in statlar:
         x0, x1 = pad, W - pad
         d.rounded_rectangle((x0, y, x1, y + karta_h), radius=20, fill=KARTA)
 
         d.text((x0 + 28, y + 24), _zavod_nomi(s["zavod"]), font=f_nom, fill=MATN)
-        st = "{:.1f}".format(s["soat"])
-        sw = d.textlength(st, font=f_katta)
-        d.text((x1 - 28 - sw - d.textlength(" soat", font=f_kichik), y + 14), st,
-               font=f_katta, fill=YASHIL)
-        d.text((x1 - 28 - d.textlength(" soat", font=f_kichik), y + 42), " soat",
-               font=f_kichik, fill=XIRA)
+        st = soat_daqiqa(s["soat"])
+        d.text((x1 - 28 - d.textlength(st, font=f_katta), y + 14), st, font=f_katta, fill=YASHIL)
 
         # 24 soatlik vaqt chizig'i
-        tx0, tx1, ty0, ty1 = x0 + 28, x1 - 28, y + 96, y + 140
+        tx0, tx1 = x0 + 28, x1 - 28
+        ty0, ty1 = y + 170, y + 212
         tw = tx1 - tx0
+
+        def x_of(daq):
+            return tx0 + tw * daq / 1440
+
         d.rounded_rectangle((tx0, ty0, tx1, ty1), radius=8, fill=CHIZIQ)
-        i = 0
         holat = s["holat"]
+        i = 0
         while i < 1440:
             h = holat[i]
             j = i
@@ -192,35 +226,30 @@ def rasm_chizish(statlar, sana_matn):
                 j += 1
             rang = {1: YASHIL, 0: KULRANG, "jim": SARIQ}.get(h)
             if rang:
-                d.rectangle((tx0 + tw * i / 1440, ty0, tx0 + tw * j / 1440, ty1), fill=rang)
+                d.rectangle((x_of(i), ty0, x_of(j), ty1), fill=rang)
             i = j
+
+        # yonish/o'chish vaqtlari chiziq ustida. Avval hamma ko'rsatkich
+        # chiziqlar, keyin fonli yozuvlar - chiziq yozuv ustidan o'tmasin.
+        joy = _belgi_joylash(d, s["belgilar"], x_of, f_vaqt, tx0, tx1)
+        qator_y = [ty0 - 34 - 26 * q for q in range(QATORLAR)]
+        for x, matn, rang, qator, xm in joy:
+            d.line((xm, qator_y[qator] + 22, xm, ty0), fill=rang, width=2)
+        for x, matn, rang, qator, xm in joy:
+            w = d.textlength(matn, font=f_vaqt)
+            ty = qator_y[qator]
+            d.rectangle((x - w / 2 - 3, ty, x + w / 2 + 3, ty + 24), fill=KARTA)
+            d.text((x - w / 2, ty), matn, font=f_vaqt, fill=rang)
+
+        # soat shkalasi chiziq ostida
         for soat in (0, 6, 12, 18, 24):
             sx = tx0 + tw * soat / 24
-            d.line((sx, ty1, sx, ty1 + 8), fill=XIRA, width=2)
-            lb = "{:02d}:00".format(soat % 24) if soat < 24 else "24:00"
+            d.line((sx, ty1, sx, ty1 + 6), fill=XIRA, width=2)
+            lb = "{:02d}:00".format(soat)
             lw = d.textlength(lb, font=f_belgi)
-            d.text((min(max(sx - lw / 2, tx0), tx1 - lw), ty1 + 10), lb, font=f_belgi, fill=XIRA)
+            d.text((min(max(sx - lw / 2, tx0), tx1 - lw), ty1 + 8), lb, font=f_belgi, fill=XIRA)
 
-        # ko'rsatkichlar - 4 ustun
-        ustunlar = [
-            ("Yondi", "{} marta".format(s["yonish_soni"])),
-            ("Birinchi yonish", s["birinchi_yonish"]),
-            ("Oxirgi o'chish", s["oxirgi_ochish"]),
-            ("Eng uzun ish", _davomiylik(s["eng_uzun_daq"])),
-        ]
-        cw = (x1 - x0 - 56) / 4
-        for k, (nom, qiymat) in enumerate(ustunlar):
-            cx = x0 + 28 + k * cw
-            d.text((cx, y + 196), nom, font=f_belgi, fill=XIRA)
-            d.text((cx, y + 224), qiymat, font=f_qiymat, fill=MATN)
-        if s["jim_daq"]:
-            jm = "Aloqa yo'q: " + _davomiylik(s["jim_daq"])
-            d.text((x0 + 28, y + karta_h - 34), jm, font=f_belgi, fill=SARIQ)
-
-        y += karta_h + 28
-
-    d.text((pad, H - 60), "Ishlagan soat - motosoat bo'yicha. Vaqt - Toshkent.",
-           font=f_belgi, fill=XIRA)
+        y += karta_h + 26
 
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
@@ -231,7 +260,6 @@ def izoh_matni(statlar, sana_matn):
     """Rasm ostidagi qisqa matn (Telegram caption)."""
     q = ["📊 Kunlik hisobot — " + sana_matn]
     for s in statlar:
-        q.append("{}: {:.1f} soat, {} marta yondi".format(
-            _zavod_nomi(s["zavod"]), s["soat"], s["yonish_soni"]))
-    q.append("Jami: {:.1f} soat".format(sum(s["soat"] for s in statlar)))
+        q.append("{}: {}".format(_zavod_nomi(s["zavod"]), soat_daqiqa(s["soat"])))
+    q.append("Jami: " + soat_daqiqa(sum(s["soat"] for s in statlar)))
     return "\n".join(q)

@@ -694,7 +694,7 @@ def holat_xabari(conn, device, event_type, event_ts, hozir):
         soat = time.strftime("%d.%m %H:%M", vaqt)
     qatorlar = ["{} {} — {}".format(belgi, zavod_nomi(device), soz), "🕐 " + soat]
     try:
-        qatorlar.append("Bugun ishlagan: {:.1f} soat".format(compute_hours_today(conn, device)))
+        qatorlar.append("Bugun ishlagan: " + hisobot.soat_daqiqa(compute_hours_today(conn, device)))
     except Exception as e:
         print("[KANAL] bugungi soat hisoblanmadi:", e)
     if hozir - event_ts > KECHIKKAN_VOQEA_S:
