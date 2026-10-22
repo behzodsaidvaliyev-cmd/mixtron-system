@@ -13,6 +13,8 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 import paho.mqtt.client as mqtt
 
+import hisobot
+
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "5a03687ae2394725ba4e934337264c51.s1.eu.hivemq.cloud")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "8883"))
 MQTT_USER = os.environ["MQTT_USER"]
@@ -57,6 +59,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # Shaxsiy chatga (TELEGRAM_CHAT_ID) jimlik ogohlantirishlari eskidek boradi.
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 KECHIKKAN_VOQEA_S = 300     # voqea bundan kech kelsa "kechikib keldi" deb belgilanadi
+
+# Kunlik infografika hisobot (hisobot.py): har kuni shu vaqtda o'tgan kun uchun
+HISOBOT_VAQTI = os.environ.get("HISOBOT_VAQTI", "00:02")
+HISOBOT_ZAVODLAR = [z.strip() for z in os.environ.get("HISOBOT_ZAVODLAR", "zavod1,zavod2,zavod3").split(",") if z.strip()]
+HAFTA_KUNLARI = ["dushanba", "seshanba", "chorshanba", "payshanba", "juma", "shanba", "yakshanba"]
 
 # RLock (oddiy Lock emas): qulf olgan funksiya ichidan yana qulf
 # oladigan funksiya chaqirilsa, oddiy Lock butun xizmatni abadiy
@@ -117,6 +124,8 @@ def get_conn():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_device_ts ON readings (device, received_ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_ts ON readings (received_ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_device_ts ON cycle_events (device, event_ts)")
+    # Kunlik hisobot qaysi sana uchun yuborilgani - qayta ishga tushganda takrorlanmasin
+    conn.execute("CREATE TABLE IF NOT EXISTS hisobot_yuborilgan (sana TEXT PRIMARY KEY, yuborilgan_ts INTEGER)")
     conn.commit()
 
     # eski yozuvlarda received_ts bo'sh qolgan - received_at matnidan orqaga qarab to'ldiramiz
@@ -614,6 +623,21 @@ class Handler(BaseHTTPRequestHandler):
                 "motosoat": r[5], "energy": r[6], "freq": r[7], "pf": r[8],
             })
 
+        elif parsed.path == "/hisobot.png":
+            # Kunlik hisobot rasmini ko'rish (kanalga yuborishdan oldin tekshirish uchun).
+            # ?sana=YYYY-MM-DD, berilmasa - kecha.
+            try:
+                sana = params.get("sana", [None])[0] or kechagi_sana()
+                png, _ = kunlik_hisobot(conn, sana)
+            except Exception as e:
+                self._send_error(400, e)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            self.end_headers()
+            self.wfile.write(png)
+
         elif parsed.path == "/holat":
             self._send_json({
                 "chegara_daqiqa": SILENCE_LIMIT_S // 60,
@@ -676,6 +700,86 @@ def holat_xabari(conn, device, event_type, event_ts, hozir):
     if hozir - event_ts > KECHIKKAN_VOQEA_S:
         qatorlar.append("⏳ kechikib keldi (aloqa uzilgan edi)")
     return chr(10).join(qatorlar)
+
+
+def kechagi_sana(hozir=None):
+    hozir = time.time() if hozir is None else hozir
+    return time.strftime("%Y-%m-%d", time.gmtime(hozir + UZ_OFFSET - 86400))
+
+
+def kunlik_hisobot(conn, sana):
+    """sana - 'YYYY-MM-DD' (mahalliy). (png, izoh) qaytaradi."""
+    kun_boshi = local_midnight_utc_ts(sana)
+    statlar = [
+        hisobot.kun_statistikasi(conn, db_lock, z, kun_boshi,
+                                 lambda d, a, b: compute_hours_range(conn, d, a, b))
+        for z in HISOBOT_ZAVODLAR
+    ]
+    t = time.strptime(sana, "%Y-%m-%d")
+    qisqa = time.strftime("%d.%m.%Y", t)
+    return (hisobot.rasm_chizish(statlar, qisqa + ", " + HAFTA_KUNLARI[t.tm_wday]),
+            hisobot.izoh_matni(statlar, qisqa))
+
+
+def telegram_rasm(png, izoh, chat_id):
+    """sendPhoto - multipart/form-data, faqat standart kutubxona bilan."""
+    if not (TELEGRAM_TOKEN and chat_id):
+        return False
+    chegara = "----mixtron" + str(int(time.time() * 1000))
+    qismlar = []
+    for nom, qiymat in (("chat_id", str(chat_id)), ("caption", izoh)):
+        qismlar.append(('--{}\r\nContent-Disposition: form-data; name="{}"\r\n\r\n{}\r\n'
+                        .format(chegara, nom, qiymat)).encode("utf-8"))
+    qismlar.append(('--{}\r\nContent-Disposition: form-data; name="photo"; filename="hisobot.png"\r\n'
+                    'Content-Type: image/png\r\n\r\n'.format(chegara)).encode("utf-8") + png + b"\r\n")
+    qismlar.append("--{}--\r\n".format(chegara).encode("utf-8"))
+    req = urllib.request.Request(
+        "https://api.telegram.org/bot{}/sendPhoto".format(TELEGRAM_TOKEN),
+        data=b"".join(qismlar),
+        headers={"Content-Type": "multipart/form-data; boundary=" + chegara})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            r.read()
+        return True
+    except Exception as e:
+        print("[HISOBOT] Telegramga yuborilmadi:", e)
+        return False
+
+
+def hisobot_kuzatuvchisi(conn):
+    """Fon oqimi: har kuni HISOBOT_VAQTI dan keyin kechagi hisobotni kanalga
+    BIR MARTA yuboradi. Yuborilgan sana bazada belgilanadi - deploy yoki qayta
+    ishga tushish takror yuborishga olib kelmaydi. Kechikib ishga tushsa ham
+    soat 06:00 gacha yuboradi; undan keyin o'tkazib yuboradi (eski hisobot
+    kun o'rtasida chiqib qolmasin)."""
+    print("[HISOBOT] kunlik hisobot yoqildi: har kuni {} da, zavodlar: {}".format(
+        HISOBOT_VAQTI, ",".join(HISOBOT_ZAVODLAR)))
+    oxirgi_urinish = 0
+    while True:
+        time.sleep(30)
+        try:
+            if not TELEGRAM_CHANNEL_ID:
+                continue
+            hozir = time.time()
+            mahalliy = time.gmtime(hozir + UZ_OFFSET)
+            if not (time.strftime("%H:%M", mahalliy) >= HISOBOT_VAQTI and mahalliy.tm_hour < 6):
+                continue
+            if hozir - oxirgi_urinish < 300:          # xato bo'lsa 5 daqiqada qayta urinadi
+                continue
+            sana = kechagi_sana(hozir)
+            with db_lock:
+                bor = conn.execute("SELECT 1 FROM hisobot_yuborilgan WHERE sana = ?", (sana,)).fetchone()
+            if bor:
+                continue
+            oxirgi_urinish = hozir
+            png, izoh = kunlik_hisobot(conn, sana)
+            if telegram_rasm(png, izoh, TELEGRAM_CHANNEL_ID):
+                with db_lock:
+                    conn.execute("INSERT OR REPLACE INTO hisobot_yuborilgan VALUES (?, ?)", (sana, int(hozir)))
+                    conn.commit()
+                print("[HISOBOT] yuborildi:", sana)
+        except Exception as e:
+            print("[HISOBOT] xato:", e)
 
 
 def jimlik_holati(conn, hozir=None):
@@ -789,6 +893,8 @@ def main():
 
     ogoh_thread = threading.Thread(target=jimlik_kuzatuvchisi, args=(conn,), daemon=True)
     ogoh_thread.start()
+
+    threading.Thread(target=hisobot_kuzatuvchisi, args=(conn,), daemon=True).start()
 
     # Ikkinchi broker (o'zimizning mixtron-broker, ichki tarmoq). Qurilmalar
     # ulardan biriga yuboradi - avval o'zimiznikiga, u ishlamasa HiveMQ'ga -
