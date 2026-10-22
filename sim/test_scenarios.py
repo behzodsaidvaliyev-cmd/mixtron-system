@@ -420,6 +420,83 @@ def run_all():
     d17 = [p for t, p in W.published[before:] if t.endswith("/data")]
     check("tiklangach ma'lumot ketdi", len(d17) > 10, "{} ta".format(len(d17)))
 
+    # =====================================================================
+    print("\n=== 18. Katta motosoat (1024 soatdan yuqori) aniq sanaladi ===")
+    # ESP32'da float 32-bitli: motosoat float bilan yig'ilganda 1024 soatdan
+    # keyin har 2 s ish 2.197 s bo'lib qo'shilardi (zavod1, 2026-10-15 dan
+    # +9.9%). CPython float'i 64-bitli - u xatoni o'zi takrorlay olmaydi.
+    # Shu sabab bu yerda butun-sekund yo'li, soat matni formati va
+    # o'qish/yozish aylanmasining ANIQLIGI tekshiriladi.
+    W.__init__()
+    new_device(tmp)
+    for f in ("last_status.txt", "events_queue.txt", "ota_pending.txt"):
+        try:
+            os.remove(os.path.join(tmp, f))
+        except OSError:
+            pass
+    for f in ("motohours.txt", "motohours.bak"):
+        with open(os.path.join(tmp, f), "w") as fh:
+            fh.write("1100.000000")
+    pub_clock = []
+
+    class _TimedList(list):
+        def append(self, x):
+            list.append(self, x)
+            pub_clock.append(W.clock)
+
+    W.published = _TimedList()
+    W.pzem_current = 9.0
+    out = boot(3600)
+    on = [(c, p.split("|")[5]) for (t, p), c in zip(W.published, pub_clock)
+          if t.endswith("/data") and "|ON|" in p]
+    if len(on) > 2:
+        moto_s = (float(on[-1][1]) - float(on[0][1])) * 3600
+        wall_s = on[-1][0] - on[0][0]
+        check("1100 soatdan keyin 1 soat ish aniq sanaldi (xato < 2 s)",
+              abs(moto_s - wall_s) < 2.0,
+              "motosoat {:.1f}s, haqiqiy {:.1f}s".format(moto_s, wall_s))
+    else:
+        check("1100 soatdan keyin 1 soat ish aniq sanaldi (xato < 2 s)", False,
+              "ON DATA yo'q: " + out)
+    check("DATA'da motosoat 4 xonali soat matni",
+          len(on) > 0 and all(len(m.split(".")[1]) == 4 for _, m in on),
+          on[-1][1] if on else "yo'q")
+    mtxt = open("motohours.txt").read().strip()
+    check("fayl soat matnida, 6 xona (eski proshivka ham o'qiydi)",
+          mtxt.startswith("1100.") or mtxt.startswith("1101."), mtxt)
+    check("fayl 6 xonali", len(mtxt.split(".")[1]) == 6, mtxt)
+
+    fw = sys.modules["main"]
+    samples = [0, 1, 2, 3599, 3600, 3601, 1024 * 3600 - 1, 1024 * 3600,
+               4211000, 16384 * 3600 + 7, 20000 * 3600 - 1]
+    samples += list(range(0, 3600 * 3, 7))
+    bad = [s for s in samples if fw._hours_text_to_sec(fw.hours_text(s, 6)) != s]
+    check("soat matni <-> sekund aylanmasi aniq (0..20000 soat)", not bad,
+          "xato: {}".format(bad[:5]))
+    old_ok = (fw._hours_text_to_sec("1156.13") == 1156 * 3600 + 468
+              and fw._hours_text_to_sec("1156.1302") == 4162069
+              and fw._hours_text_to_sec("1000") == 3600000
+              and fw._hours_text_to_sec("1e3") == 3600000)
+    check("eski fayl formatlari o'qiladi", old_ok)
+    rejected = 0
+    for junk in ("", "abc", "nan", "inf", "-5", "1.2.3", "12a.5"):
+        try:
+            fw._hours_text_to_sec(junk)
+        except (ValueError, OverflowError):
+            rejected += 1
+    check("buzuq matn rad etildi", rejected == 7, "{}/7".format(rejected))
+
+    boots = [e for e in event_lines() if "|BOOT|" in e]
+    check("BOOT voqeasida reset sababi (rc=)",
+          len(boots) > 0 and boots[-1].endswith("|rc=1"),
+          boots[-1] if boots else "yo'q")
+    resolved = fw._resolve_event_time(
+        "EVENT|-5|BOOT|1100.0000|{}|rc=3".format(fw.BOOT_ID))
+    rp = resolved.split("|") if resolved else []
+    check("oflayn BOOT: rc saqlandi, yoqilish raqami yuborilmadi",
+          len(rp) == 5 and rp[4] == "rc=3" and int(rp[1]) > 0, str(resolved))
+    check("WDT ishga tushmadi", "WDT" not in out, out)
+
     print("\n" + "=" * 62)
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)

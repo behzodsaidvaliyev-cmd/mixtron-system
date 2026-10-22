@@ -312,30 +312,74 @@ def save_threshold(value):
     _atomic_write(THRESHOLD_FILE, str(value))
 
 
-def load_motohours():
+# --- MOTOSOAT BUTUN SEKUNDLARDA ---
+# MUHIM: ESP32 MicroPython'da float 32-BITLI (~7 xona aniqlik). Motosoat
+# avval soatda float bilan yig'ilardi: har 2 soniyada +0.000556 soat qo'shilib,
+# natija float32 ning eng kichik qadamiga yaxlitlanardi. 1024 soatdan keyin bu
+# qadam 0.44 s - har 2 s ish 2.197 s bo'lib sanalardi (+9.9%). zavod1'da aynan
+# shunday bo'ldi: 2026-10-15 da 1024 soatdan o'tgach kunlik soatlar 10% oshib
+# ketdi. 1024 dan past -1.1%, 2048 dan keyin -12%, 16384 da umuman to'xtaydi.
+# Shu sabab motosoat ichkarida BUTUN SEKUND (int) bo'lib yig'iladi - butun
+# sonlar MicroPython'da aniq. Soat matni faqat yuborish/saqlash payti
+# butun son arifmetikasi bilan yasaladi; fayl va MQTT formati o'zgarmaydi.
+
+def hours_text(sec, places=4):
+    """Butun sekundni soat matniga ("1156.1302") aylantiradi - float'siz.
+    Kasr qismi qirqiladi (yaxlitlanmaydi), shuning uchun qiymat hech qachon
+    orqaga ketmaydi."""
+    if places == 6:
+        return "{}.{:06d}".format(sec // 3600, (sec % 3600) * 1000000 // 3600)
+    return "{}.{:04d}".format(sec // 3600, (sec % 3600) * 10000 // 3600)
+
+
+def _hours_text_to_sec(txt):
+    """Soat matnini butun sekundga aylantiradi. float() orqali EMAS: 32-bitli
+    float 1156 soatda ~0.2 s xato beradi. Noto'g'ri matnda ValueError."""
+    parts = txt.split(".")
+    if (len(parts) <= 2 and parts[0].isdigit()
+            and (len(parts) == 1 or parts[1].isdigit())):
+        frac = (parts[1] + "000000")[:6] if len(parts) == 2 else "0"
+        return int(parts[0]) * 3600 + (int(frac) * 3600 + 500000) // 1000000
+    h = float(txt)                     # boshqa format (masalan "1e3")
+    if not (0 <= h < 10000000):        # nan, manfiy, mantiqsiz
+        raise ValueError(txt)
+    return int(h * 3600 + 0.5)
+
+
+def _read_motosec(path):
+    try:
+        with open(path) as f:
+            return _hours_text_to_sec(f.read().strip())
+    except (OSError, ValueError, OverflowError):
+        return -1
+
+
+def load_motosec():
     """Motosoat IKKI nusxada saqlanadi. Bittasi buzilsa (quvvat yozish paytida
     uzilsa, flesh eskirsa) ikkinchisi qoladi. Motosoat faqat o'sadi, shuning
     uchun ikkalasidan KATTASI olinadi - hech qachon nolga tushib ketmaydi.
     Bir nusxada bu xato butun ish tarixini yo'qotardi."""
-    a = _read_float(MOTOHOURS_FILE, -1.0)
-    b = _read_float(MOTOHOURS_BAK_FILE, -1.0)
+    a = _read_motosec(MOTOHOURS_FILE)
+    b = _read_motosec(MOTOHOURS_BAK_FILE)
     best = max(a, b)
     if best < 0:
-        return 0.0
+        return 0
     if a != b:
         # O'Z-O'ZINI TIKLASH: bitta nusxa buzilgan/eskirgan bo'lsa, darhol
         # ikkalasi ham to'g'ri qiymat bilan qayta yoziladi. Busiz buzilishlar
         # to'planib borar va oxiri IKKALA nusxa ham yo'qolib, butun ish
         # tarixi nolga tushib ketardi.
-        print("[MOTOSOAT] nusxalar farq qildi (a={}, b={}) - {} tiklandi".format(a, b, best))
-        save_motohours(best)
+        print("[MOTOSOAT] nusxalar farq qildi (a={}s, b={}s) - {} tiklandi".format(
+            a, b, hours_text(best)))
+        save_motosec(best)
     return best
 
 
-def save_motohours(hours):
+def save_motosec(sec):
     """Ikkala nusxaga ham yozadi. Disk to'lgan/nosoz bo'lsa QULAMAYDI -
-    o'lchash davom etadi, faqat saqlash keyinga qoladi."""
-    txt = "{:.6f}".format(hours)
+    o'lchash davom etadi, faqat saqlash keyinga qoladi. Fayl soat matnida
+    (6 xona) - eski proshivka ham o'qiy oladi (OTA orqaga qaytsa)."""
+    txt = hours_text(sec, 6)
     ok = False
     for path in (MOTOHOURS_FILE, MOTOHOURS_BAK_FILE):
         try:
@@ -1196,19 +1240,25 @@ def _next_boot_id():
 BOOT_ID = _next_boot_id()
 
 
-def queue_event(event_type, motosoat):
+def queue_event(event_type, motosec, extra=None):
     # Agar NTP hali sozlanmagan bo'lsa (internetsiz yonganda), haqiqiy sana
     # ma'lum emas. Bunday paytda vaqt o'rniga MANFIY "uptime belgisi" yoziladi.
     # Yuborish paytida (vaqt allaqachon sozlangan bo'ladi) u haqiqiy sanaga
     # aylantiriladi - shunday qilib oflayn voqealar ham to'g'ri vaqtga tushadi.
+    # extra - qo'shimcha "kalit=qiymat" maydoni (masalan BOOT uchun "rc=3").
+    # Server faqat dastlabki 4 maydonni o'qiydi, qolgani eski logger'ni buzmaydi.
     if time_is_valid():
-        line = "EVENT|{}|{}|{:.4f}".format(
-            int(time.time() + UNIX_EPOCH_OFFSET), event_type, motosoat)
+        line = "EVENT|{}|{}|{}".format(
+            int(time.time() + UNIX_EPOCH_OFFSET), event_type, hours_text(motosec))
+        if extra:
+            line += "|" + extra
     else:
         # 5-maydon: yoqilish raqami. Yuborishda shu raqam joriy yoqilishga
         # mos kelsa, aniq vaqt hisoblanadi; mos kelmasa (orada qayta yuklangan)
         # aniq vaqtni bilib bo'lmaydi - internet qaytgan payt taxminan olinadi.
-        line = "EVENT|{}|{}|{:.4f}|{}".format(-uptime_s(), event_type, motosoat, BOOT_ID)
+        line = "EVENT|{}|{}|{}|{}".format(-uptime_s(), event_type, hours_text(motosec), BOOT_ID)
+        if extra:
+            line += "|" + extra
     try:
         if _queue_line_count() >= EVENTS_QUEUE_MAX_LINES:
             print("[EVENT] navbat to'ldi, eng eskilari tashlab yuborildi")
@@ -1256,7 +1306,7 @@ def _resolve_event_time(line):
         if uptime_s() < NTP_GIVEUP_S:
             return None      # hali NTP tuzalishi mumkin - kutamiz
         parts[1] = "0"       # "vaqt noma'lum" belgisi; serverda to'ldiriladi
-        return "|".join(parts[:4])
+        return "|".join(parts[:4] + parts[5:])
 
     same_boot = False
     if len(parts) >= 5:
@@ -1277,7 +1327,8 @@ def _resolve_event_time(line):
         age = uptime_s()
 
     parts[1] = str(int(time.time() + UNIX_EPOCH_OFFSET) - age)
-    return "|".join(parts[:4])       # 5-maydon (yoqilish raqami) yuborilmaydi
+    # 5-maydon (yoqilish raqami) yuborilmaydi, undan keyingilari (extra) qoladi
+    return "|".join(parts[:4] + parts[5:])
 
 
 def flush_event_queue(client):
@@ -1468,7 +1519,7 @@ def main():
     if wifi_is_up():
         sync_time()
 
-    motohours = load_motohours()
+    motosec = load_motosec()           # BUTUN sekund - float emas (yuqoriga qarang)
     last_status = load_last_status()   # reboot'dan keyin soxta voqea yozilmaydi
     now = time.time()
     last_poll = now
@@ -1480,12 +1531,20 @@ def main():
     last_ntp_retry = now
     last_ntp_resync = now
     boot_mono = uptime_s()             # OTA barqarorligini o'lchash uchun
-    saved_motohours = motohours        # flesh'ga keraksiz yozmaslik uchun
+    saved_motosec = motosec            # flesh'ga keraksiz yozmaslik uchun
 
     # Yoqilish xabari: Railway'da ko'rinadi. Qurilma tez-tez qayta yuklanayotgan
     # bo'lsa (nosozlik alomati) buni darhol payqash mumkin - avval uch qurilma
     # 6 kun jim turgani sezilmay qolgan edi.
-    queue_event("BOOT", motohours)
+    # rc = machine.reset_cause(): 1 = quvvat yoqildi / kuchlanish tushdi
+    # (brownout), 3 = WDT (kod qotgan), 5 = dastur o'zi qayta yukladi
+    # (xato, OTA, REBOOT buyrug'i), 2 = EN tugmasi. zavod1 2026-10-21 da
+    # 3 marta qayta yuklangan - sababini aniqlab bo'lmagan edi.
+    try:
+        rc = machine.reset_cause()
+    except Exception:
+        rc = 0
+    queue_event("BOOT", motosec, "rc={}".format(rc))
 
     client = None
     try:
@@ -1563,16 +1622,18 @@ def main():
 
         # --- PZEM o'qish ---
         if now - last_poll >= POLL_INTERVAL_S:
-            dt_raw = now - last_poll
+            # Butun sekundlar farqi: qurilmada time.time() o'zi butun son.
+            # int() ikkala tomonda - yig'indi baribir to'liq vaqtga teng bo'ladi.
+            dt_raw = int(now) - int(last_poll)
             last_poll = now
             # HIMOYA: vaqt sakrashi (NTP, soat nosozligi) dt'ni ulkan qilib,
             # motosoatni butunlay buzib yuborishi mumkin - u esa flesh'ga
             # saqlanadi, ya'ni xato ABADIY qolardi. Mantiqsiz qiymat rad etiladi.
             if dt_raw < 0 or dt_raw > MAX_SANE_DT_S:
                 print("[TIME] mantiqsiz vaqt farqi ({}s) - motosoatga qo'shilmadi".format(dt_raw))
-                dt_hours = 0.0
+                dt_s = 0
             else:
-                dt_hours = dt_raw / 3600.0
+                dt_s = dt_raw
 
             reading = pzem_read()
 
@@ -1583,29 +1644,29 @@ def main():
                 if pzem_fail_count % PZEM_REINIT_AFTER_FAILS == 0:
                     reinit_uart()
                 status = "OFF"
-                data_line = "DATA|OFF|0.0|0.000|0.0|{:.4f}|0|0.0|0.00".format(motohours)
+                data_line = "DATA|OFF|0.0|0.000|0.0|{}|0|0.0|0.00".format(hours_text(motosec))
             else:
                 pzem_fail_count = 0
                 status = "ON" if reading["current"] > amp_threshold else "OFF"
                 if status == "ON":
-                    motohours += dt_hours
-                data_line = "DATA|{}|{:.1f}|{:.3f}|{:.1f}|{:.4f}|{}|{:.1f}|{:.2f}".format(
+                    motosec += dt_s
+                data_line = "DATA|{}|{:.1f}|{:.3f}|{:.1f}|{}|{}|{:.1f}|{:.2f}".format(
                     status, reading["voltage"], reading["current"], reading["power"],
-                    motohours, reading["energy"], reading["freq"], reading["pf"])
+                    hours_text(motosec), reading["energy"], reading["freq"], reading["pf"])
 
             if PRINT_DATA_LINES:
                 print(data_line)
 
             # --- ON/OFF o'zgarishi ---
             if status != last_status:
-                queue_event(status, motohours)
+                queue_event(status, motosec)
                 last_status = status
                 save_last_status(status)
                 # Sikl tugagan payt - motosoatni darhol saqlash (quvvat shu
                 # zahoti uzilsa ham oxirgi ish vaqti yo'qolmasin)
-                if abs(motohours - saved_motohours) > 1e-6:
-                    if save_motohours(motohours):
-                        saved_motohours = motohours
+                if motosec != saved_motosec:
+                    if save_motosec(motosec):
+                        saved_motosec = motosec
                 client = flush_event_queue(client)
 
             # --- MQTT'ga yuborish ---
@@ -1624,9 +1685,9 @@ def main():
             # (kuniga 1440 marta), bu yillar davomida flesh xotirani eskirtiradi.
             if now - last_save >= MOTOHOURS_SAVE_INTERVAL_S:
                 last_save = now
-                if abs(motohours - saved_motohours) > 1e-6:
-                    if save_motohours(motohours):
-                        saved_motohours = motohours
+                if motosec != saved_motosec:
+                    if save_motosec(motosec):
+                        saved_motosec = motosec
                 client = flush_event_queue(client)
 
             # --- OTA (kuniga bir marta) ---
