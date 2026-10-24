@@ -107,14 +107,9 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
 QISQA_TOXTASH_DAQ = 5       # bundan qisqa to'xtash chiziqda ko'rinadi, lekin vaqti yozilmaydi
 
 
-def _belgilar(holat):
-    """Chiziqqa yoziladigan yonish/o'chish vaqtlari: [(daqiqa, "ON"/"OFF")].
-
-    Vaqt chizig'idan olinadi, cycle_events dan emas: qurilma qayta
-    yuklanganda (BOOT) soniyalik soxta OFF/ON voqealari yoziladi -
-    2026-10-21 zavod1 da "o'chish 18:38" aslida qayta yuklanish edi.
-    QISQA_TOXTASH_DAQ dan qisqa to'xtashning ikkala chegarasi ham yozilmaydi."""
-    bolaklar = []                      # (boshi, oxiri, holat)
+def _bolaklar(holat):
+    """[(boshi, oxiri, holat)] - bir xil holatdagi ketma-ket daqiqalar."""
+    bolaklar = []
     i = 0
     while i < 1440:
         j = i
@@ -122,18 +117,45 @@ def _belgilar(holat):
             j += 1
         bolaklar.append((i, j, holat[i]))
         i = j
+    return bolaklar
+
+
+def _belgilar(holat):
+    """Chiziqqa yoziladigan yonish/o'chish vaqtlari: [(daqiqa, "ON"/"OFF")].
+
+    Vaqt chizig'idan olinadi, cycle_events dan emas: qurilma qayta
+    yuklanganda (BOOT) soniyalik soxta OFF/ON voqealari yoziladi -
+    2026-10-21 zavod1 da "o'chish 18:38" aslida qayta yuklanish edi.
+
+    Yozuvlar SILLIQLANGAN chiziqdan olinadi: QISQA_TOXTASH_DAQ dan qisqa
+    to'xtash ham, shunchalik qisqa ishlash ham oldingi holatga qo'shib
+    yuboriladi. Chiziqning o'zida ular rangda ko'rinadi, faqat vaqti
+    yozilmaydi - aks holda 1 daqiqalik "yondi 08:28 / o'chdi 08:29"
+    juftlari yozuvlarni ustma-ust bostirib yuboradi."""
+    silliq = list(holat)
+    ozgardi = True
+    while ozgardi:
+        ozgardi = False
+        bolaklar = _bolaklar(silliq)
+        for k in range(1, len(bolaklar)):
+            boshi, oxiri, h = bolaklar[k]
+            oldingi = bolaklar[k - 1][2]
+            # oxirgi bo'lak (kun oxiri yoki "hozir") qisqa bo'lsa ham saqlanadi
+            if (h in (0, 1) and oldingi in (0, 1) and h != oldingi
+                    and oxiri - boshi < QISQA_TOXTASH_DAQ and k < len(bolaklar) - 1
+                    and bolaklar[k + 1][2] is not None):
+                for m in range(boshi, oxiri):
+                    silliq[m] = oldingi
+                ozgardi = True
+                break
     natija = []
+    bolaklar = _bolaklar(silliq)
     for k in range(1, len(bolaklar)):
-        oldin, hozir = bolaklar[k - 1], bolaklar[k]
-        if oldin[2] == 0 and hozir[2] == 1:
-            toxtash = oldin[1] - oldin[0]
-            if toxtash >= QISQA_TOXTASH_DAQ or oldin[0] == 0:
-                natija.append((hozir[0], "ON"))
-        elif oldin[2] == 1 and hozir[2] == 0:
-            toxtash = hozir[1] - hozir[0]
-            # kun oxirigacha (yoki hozirgacha) davom etayotgan to'xtash ham yoziladi
-            if toxtash >= QISQA_TOXTASH_DAQ or hozir[1] == 1440 or (k + 1 < len(bolaklar) and bolaklar[k + 1][2] is None):
-                natija.append((hozir[0], "OFF"))
+        oldin, hozir = bolaklar[k - 1][2], bolaklar[k]
+        if oldin == 0 and hozir[2] == 1:
+            natija.append((hozir[0], "ON"))
+        elif oldin == 1 and hozir[2] == 0:
+            natija.append((hozir[0], "OFF"))
     return natija
 
 
@@ -151,17 +173,18 @@ def _zavod_nomi(device):
     return "Zavod " + device[5:] if device.startswith("zavod") else device
 
 
-QATORLAR = 3                # vaqt yozuvlari uchun qatorlar soni (chiziq ustida)
+QATORLAR = 4                # vaqt yozuvlari uchun qatorlar soni (chiziq ustida)
 
 
-def _belgi_joylash(d, belgilar, x_of, font, chap, ong):
+def _belgi_joylash(d, belgilar, x_of, font, chap, ong, boshlanish_daq=0):
     """Vaqt yozuvlarini qatorlarga taqsimlaydi: yaqin turgan yozuvlar
     ustma-ust tushmasin. [(x_markaz, matn, rang, qator, x_chiziq)] qaytaradi.
     Har yozuv eng pastki bo'sh qatorga tushadi (chiziqqa eng yaqin)."""
     joy = []
     band = [-1e9] * QATORLAR            # har qatorda oxirgi yozuvning o'ng cheti
     for daq, tur in belgilar:
-        matn = "{:02d}:{:02d}".format(daq // 60, daq % 60)
+        soat_daq = (boshlanish_daq + daq) % 1440      # oraliq boshidan -> sutka vaqti
+        matn = "{:02d}:{:02d}".format(soat_daq // 60, soat_daq % 60)
         w = d.textlength(matn, font=font)
         x = min(max(x_of(daq), chap + w / 2), ong - w / 2)
         qator = next((q for q in range(QATORLAR) if x - w / 2 > band[q] + 10),
@@ -171,11 +194,13 @@ def _belgi_joylash(d, belgilar, x_of, font, chap, ong):
     return joy
 
 
-def rasm_chizish(statlar, sana_matn):
-    """statlar - kun_statistikasi() natijalari ro'yxati. PNG bayt qaytaradi."""
+def rasm_chizish(statlar, sana_matn, sarlavha="kunlik hisobot", boshlanish_daq=0):
+    """statlar - kun_statistikasi() natijalari ro'yxati. PNG bayt qaytaradi.
+    boshlanish_daq - 24 soatlik oraliq sutkaning qaysi daqiqasidan boshlanadi
+    (kunlik hisobot 0 = 00:00, smena hisoboti 480 = 08:00)."""
     W = 1080
     pad = 48
-    karta_h = 270
+    karta_h = 296
     H = 230 + len(statlar) * (karta_h + 26) + 20
     img = Image.new("RGB", (W, H), FON)
     d = ImageDraw.Draw(img)
@@ -189,7 +214,7 @@ def rasm_chizish(statlar, sana_matn):
     f_vaqt = _font(21, True)
 
     d.text((pad, 40), "MIXTRON", font=f_sarlavha, fill=YASHIL)
-    d.text((pad + d.textlength("MIXTRON ", font=f_sarlavha), 40), "kunlik hisobot",
+    d.text((pad + d.textlength("MIXTRON ", font=f_sarlavha), 40), sarlavha,
            font=f_sarlavha, fill=MATN)
     d.text((pad, 104), sana_matn, font=f_kichik, fill=XIRA)
 
@@ -217,7 +242,7 @@ def rasm_chizish(statlar, sana_matn):
 
         # 24 soatlik vaqt chizig'i
         tx0, tx1 = x0 + 28, x1 - 28
-        ty0, ty1 = y + 170, y + 212
+        ty0, ty1 = y + 196, y + 238
         tw = tx1 - tx0
 
         def x_of(daq):
@@ -238,7 +263,7 @@ def rasm_chizish(statlar, sana_matn):
 
         # yonish/o'chish vaqtlari chiziq ustida. Avval hamma ko'rsatkich
         # chiziqlar, keyin fonli yozuvlar - chiziq yozuv ustidan o'tmasin.
-        joy = _belgi_joylash(d, s["belgilar"], x_of, f_vaqt, tx0, tx1)
+        joy = _belgi_joylash(d, s["belgilar"], x_of, f_vaqt, tx0, tx1, boshlanish_daq)
         qator_y = [ty0 - 34 - 26 * q for q in range(QATORLAR)]
         for x, matn, rang, qator, xm in joy:
             d.line((xm, qator_y[qator] + 22, xm, ty0), fill=rang, width=2)
@@ -252,7 +277,7 @@ def rasm_chizish(statlar, sana_matn):
         for soat in (0, 6, 12, 18, 24):
             sx = tx0 + tw * soat / 24
             d.line((sx, ty1, sx, ty1 + 6), fill=XIRA, width=2)
-            lb = "{:02d}:00".format(soat)
+            lb = "24:00" if (boshlanish_daq == 0 and soat == 24) else "{:02d}:00".format((boshlanish_daq // 60 + soat) % 24)
             lw = d.textlength(lb, font=f_belgi)
             d.text((min(max(sx - lw / 2, tx0), tx1 - lw), ty1 + 8), lb, font=f_belgi, fill=XIRA)
 

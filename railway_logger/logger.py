@@ -62,6 +62,9 @@ KECHIKKAN_VOQEA_S = 300     # voqea bundan kech kelsa "kechikib keldi" deb belgi
 
 # Kunlik infografika hisobot (hisobot.py): har kuni shu vaqtda o'tgan kun uchun
 HISOBOT_VAQTI = os.environ.get("HISOBOT_VAQTI", "00:02")
+# Smena hisoboti: 08:00 dan keyingi kun 08:00 gacha, shu vaqtda yuboriladi
+SMENA_VAQTI = os.environ.get("SMENA_VAQTI", "08:01")
+SMENA_BOSHI_SOAT = 8
 HISOBOT_ZAVODLAR = [z.strip() for z in os.environ.get("HISOBOT_ZAVODLAR", "zavod1,zavod2,zavod3").split(",") if z.strip()]
 HAFTA_KUNLARI = ["dushanba", "seshanba", "chorshanba", "payshanba", "juma", "shanba", "yakshanba"]
 
@@ -628,11 +631,15 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         elif parsed.path == "/hisobot.png":
-            # Kunlik hisobot rasmini ko'rish (kanalga yuborishdan oldin tekshirish uchun).
-            # ?sana=YYYY-MM-DD, berilmasa - kecha.
+            # Hisobot rasmini ko'rish (kanalga yuborishdan oldin tekshirish uchun).
+            # ?sana=YYYY-MM-DD, berilmasa - kecha. ?tur=smena - sana 08:00 dan
+            # keyingi kun 08:00 gacha bo'lgan smena hisoboti.
             try:
                 sana = params.get("sana", [None])[0] or kechagi_sana()
-                png, _ = kunlik_hisobot(conn, sana)
+                if params.get("tur", [""])[0] == "smena":
+                    png, _ = smena_hisoboti(conn, sana)
+                else:
+                    png, _ = kunlik_hisobot(conn, sana)
             except Exception as e:
                 self._send_error(400, e)
                 return
@@ -725,6 +732,23 @@ def kunlik_hisobot(conn, sana):
             hisobot.izoh_matni(statlar, qisqa))
 
 
+def smena_hisoboti(conn, sana):
+    """sana - smena boshlangan kun ('YYYY-MM-DD'): sana 08:00 -> keyingi kun 08:00."""
+    boshi = local_midnight_utc_ts(sana) + SMENA_BOSHI_SOAT * 3600
+    statlar = [
+        hisobot.kun_statistikasi(conn, db_lock, z, boshi,
+                                 lambda d, a, b: compute_hours_range(conn, d, a, b))
+        for z in HISOBOT_ZAVODLAR
+    ]
+    t1 = time.gmtime(boshi + UZ_OFFSET)
+    t2 = time.gmtime(boshi + 86400 + UZ_OFFSET)
+    oraliq = "{} {:02d}:00 – {} {:02d}:00".format(
+        time.strftime("%d.%m", t1), SMENA_BOSHI_SOAT, time.strftime("%d.%m.%Y", t2), SMENA_BOSHI_SOAT)
+    return (hisobot.rasm_chizish(statlar, oraliq, sarlavha="smena hisoboti",
+                                 boshlanish_daq=SMENA_BOSHI_SOAT * 60),
+            hisobot.izoh_matni(statlar, oraliq))
+
+
 def telegram_rasm(png, izoh, chat_id):
     """sendPhoto - multipart/form-data, faqat standart kutubxona bilan."""
     if not (TELEGRAM_TOKEN and chat_id):
@@ -753,41 +777,54 @@ def telegram_rasm(png, izoh, chat_id):
         return False
 
 
+# (nom, yuborish vaqti, shu soatdan keyin o'tkazib yuboriladi, baza kaliti, yasovchi)
+# Kalit: kunlik - "YYYY-MM-DD" (avvalgi yozuvlar bilan mos), smena - "smena:YYYY-MM-DD".
+def _hisobot_turlari():
+    return (
+        ("kunlik", HISOBOT_VAQTI, 6, lambda sana: sana, kunlik_hisobot),
+        ("smena", SMENA_VAQTI, 12, lambda sana: "smena:" + sana, smena_hisoboti),
+    )
+
+
 def hisobot_kuzatuvchisi(conn):
-    """Fon oqimi: har kuni HISOBOT_VAQTI dan keyin kechagi hisobotni kanalga
-    BIR MARTA yuboradi. Yuborilgan sana bazada belgilanadi - deploy yoki qayta
-    ishga tushish takror yuborishga olib kelmaydi. Kechikib ishga tushsa ham
-    soat 06:00 gacha yuboradi; undan keyin o'tkazib yuboradi (eski hisobot
-    kun o'rtasida chiqib qolmasin)."""
-    print("[HISOBOT] kunlik hisobot yoqildi: har kuni {} da, zavodlar: {}".format(
-        HISOBOT_VAQTI, ",".join(HISOBOT_ZAVODLAR)))
-    oxirgi_urinish = 0
+    """Fon oqimi: har kuni kunlik (00:02) va smena (08:01) hisobotlarini
+    kanalga BIR MARTADAN yuboradi. Ikkalasi ham kechagi sana bo'yicha: kunlik -
+    kechagi 00:00-24:00, smena - kechagi 08:00 dan bugungi 08:00 gacha.
+    Yuborilgani bazada belgilanadi - deploy yoki qayta ishga tushish takror
+    yuborishga olib kelmaydi. Kechikib ishga tushsa ham kunlik 06:00 gacha,
+    smena 12:00 gacha yuboriladi; undan keyin o'tkazib yuboriladi (eski
+    hisobot kun o'rtasida chiqib qolmasin)."""
+    print("[HISOBOT] yoqildi: kunlik {}, smena {} da; zavodlar: {}".format(
+        HISOBOT_VAQTI, SMENA_VAQTI, ",".join(HISOBOT_ZAVODLAR)))
+    oxirgi_urinish = {}
     while True:
         time.sleep(30)
-        try:
-            if not TELEGRAM_CHANNEL_ID:
-                continue
-            hozir = time.time()
-            mahalliy = time.gmtime(hozir + UZ_OFFSET)
-            if not (time.strftime("%H:%M", mahalliy) >= HISOBOT_VAQTI and mahalliy.tm_hour < 6):
-                continue
-            if hozir - oxirgi_urinish < 300:          # xato bo'lsa 5 daqiqada qayta urinadi
-                continue
-            sana = kechagi_sana(hozir)
-            with db_lock:
-                bor = conn.execute("SELECT 1 FROM hisobot_yuborilgan WHERE sana = ?", (sana,)).fetchone()
-            if bor:
-                continue
-            oxirgi_urinish = hozir
-            png, _ = kunlik_hisobot(conn, sana)
-            # rasm matnsiz yuboriladi - foydalanuvchi so'rovi (hamma narsa rasmda)
-            if telegram_rasm(png, "", TELEGRAM_CHANNEL_ID):
+        if not TELEGRAM_CHANNEL_ID:
+            continue
+        for nom, vaqt, chegara_soat, kalit_fn, yasovchi in _hisobot_turlari():
+            try:
+                hozir = time.time()
+                mahalliy = time.gmtime(hozir + UZ_OFFSET)
+                if not (time.strftime("%H:%M", mahalliy) >= vaqt and mahalliy.tm_hour < chegara_soat):
+                    continue
+                if hozir - oxirgi_urinish.get(nom, 0) < 300:   # xato bo'lsa 5 daqiqada qayta
+                    continue
+                sana = kechagi_sana(hozir)
+                kalit = kalit_fn(sana)
                 with db_lock:
-                    conn.execute("INSERT OR REPLACE INTO hisobot_yuborilgan VALUES (?, ?)", (sana, int(hozir)))
-                    conn.commit()
-                print("[HISOBOT] yuborildi:", sana)
-        except Exception as e:
-            print("[HISOBOT] xato:", e)
+                    bor = conn.execute("SELECT 1 FROM hisobot_yuborilgan WHERE sana = ?", (kalit,)).fetchone()
+                if bor:
+                    continue
+                oxirgi_urinish[nom] = hozir
+                png, _ = yasovchi(conn, sana)
+                # rasm matnsiz yuboriladi - foydalanuvchi so'rovi (hamma narsa rasmda)
+                if telegram_rasm(png, "", TELEGRAM_CHANNEL_ID):
+                    with db_lock:
+                        conn.execute("INSERT OR REPLACE INTO hisobot_yuborilgan VALUES (?, ?)", (kalit, int(hozir)))
+                        conn.commit()
+                    print("[HISOBOT] yuborildi:", kalit)
+            except Exception as e:
+                print("[HISOBOT] xato ({}):".format(nom), e)
 
 
 def jimlik_holati(conn, hozir=None):
