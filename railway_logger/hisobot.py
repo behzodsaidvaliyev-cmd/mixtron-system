@@ -51,6 +51,15 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
             "ORDER BY received_ts DESC LIMIT 1",
             (device, kun_boshi),
         ).fetchone()
+        # Qurilma aloqa yo'q paytda ON/OFF voqealarini o'z xotirasida aniq vaqti
+        # bilan saqlaydi va aloqa tiklanganda yuboradi - bo'shliqlar shular bilan
+        # bo'yaladi. BOOT olinmaydi (qurilma yoqilgani, drobilka ishi emas).
+        voqealar = conn.execute(
+            "SELECT event_ts, event_type FROM cycle_events "
+            "WHERE device = ? AND event_ts >= ? AND event_ts < ? AND event_type IN ('ON','OFF') "
+            "ORDER BY event_ts",
+            (device, kun_boshi, kun_oxiri),
+        ).fetchall()
 
     # Daqiqalik holat: 1 = ishladi, 0 = to'xtagan, None = o'lchov yo'q.
     # mot_oxiri[i] - shu daqiqadagi oxirgi motosoat, mot_boshi[i] - birinchisi.
@@ -68,11 +77,15 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
                 mot_boshi[i] = mot
             mot_oxiri[i] = mot
 
-    # O'lchov kelmagan daqiqalar (aloqa uzilishi, qayta ulanish) MOTOSOAT
-    # bo'yicha to'ldiriladi: ESP32 motosoatni aloqasiz ham hisoblab turadi.
-    # Bo'shliq davomida motosoat bo'shliq uzunligining kamida yarmicha
-    # o'sgan bo'lsa - zavod ishlagan, aks holda to'xtagan. Chegaralardan
-    # biri yo'q bo'lsa (kun boshi/oxiri) - qo'shni holat olinadi.
+    voqea_daq = [(int((ts - kun_boshi) // 60), 1 if t == "ON" else 0) for ts, t in voqealar]
+
+    # O'lchov kelmagan daqiqalar (aloqa uzilishi, qayta ulanish) to'ldiriladi:
+    # 1) bo'shliq ichida qurilmaning saqlangan ON/OFF voqealari bo'lsa - holat
+    #    aynan o'sha daqiqalarda almashadi (masalan 2026-10-19 zavod1: aloqa
+    #    09:42-11:58 yo'q edi, 09:51 dagi yonish keyin yetib kelgan);
+    # 2) voqea bo'lmasa - MOTOSOAT bo'yicha: bo'shliq davomida motosoat bo'shliq
+    #    uzunligining kamida yarmicha o'sgan bo'lsa ishlagan, aks holda to'xtagan.
+    #    Chegaralardan biri yo'q bo'lsa (kun boshi/oxiri) - qo'shni holat olinadi.
     hozir_daq = int((time.time() - kun_boshi) // 60)
     oxirgi = min(1440, max(hozir_daq, 0))       # bugungi kunning kelajagi bo'yalmaydi
     holat = list(daq)
@@ -84,6 +97,17 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
         j = i
         while j < oxirgi and holat[j] is None:
             j += 1
+        ichida = [(m, h) for m, h in voqea_daq if i <= m < j]
+        if ichida:
+            joriy = holat[i - 1] if i > 0 and holat[i - 1] in (0, 1) else 1 - ichida[0][1]
+            n = 0
+            for k in range(i, j):
+                while n < len(ichida) and ichida[n][0] <= k:
+                    joriy = ichida[n][1]
+                    n += 1
+                holat[k] = joriy
+            i = j
+            continue
         oldin = mot_oxiri[i - 1] if i > 0 else (oldingi_row[0] if oldingi_row else None)
         keyin = mot_boshi[j] if j < 1440 else None
         if oldin is not None and keyin is not None:
