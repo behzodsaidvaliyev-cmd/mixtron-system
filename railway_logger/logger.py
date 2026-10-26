@@ -431,13 +431,13 @@ class Handler(BaseHTTPRequestHandler):
             limit = int(params.get("limit", ["200"])[0])
             with db_lock:
                 rows = conn.execute(
-                    "SELECT event_time_local, event_type, motosoat FROM cycle_events "
+                    "SELECT event_time_local, event_type, motosoat, event_ts, received_at FROM cycle_events "
                     "WHERE device = ? ORDER BY event_ts DESC LIMIT ?",
                     (device, limit),
                 ).fetchall()
             self._send_json({
                 "zavod": device,
-                "events": [{"vaqt": r[0], "holat": r[1], "motosoat": r[2]} for r in rows],
+                "events": [voqea_json(r) for r in rows],
             })
 
         elif parsed.path == "/events.csv":
@@ -631,6 +631,22 @@ class Handler(BaseHTTPRequestHandler):
                 "motosoat": r[5], "energy": r[6], "freq": r[7], "pf": r[8],
             })
 
+        elif parsed.path == "/timeline":
+            # Daqiqalik holat bo'laklari (hisobot rasmi bilan aynan bir xil hisob).
+            # ?zavod=... (berilmasa - hammasi), ?sana=YYYY-MM-DD (berilmasa - bugun),
+            # ?tur=smena - sana 08:00 dan keyingi kun 08:00 gacha.
+            try:
+                sana = params.get("sana", [None])[0] or time.strftime(
+                    "%Y-%m-%d", time.gmtime(time.time() + UZ_OFFSET))
+                tur = "smena" if params.get("tur", [""])[0] == "smena" else "kun"
+                if "zavod" in params:
+                    self._send_json(timeline_json(conn, params["zavod"][0], sana, tur))
+                else:
+                    self._send_json({"zavodlar": [timeline_json(conn, z, sana, tur)
+                                                  for z in HISOBOT_ZAVODLAR]})
+            except Exception as e:
+                self._send_error(400, e)
+
         elif parsed.path == "/hisobot.png":
             # Hisobot rasmini ko'rish (kanalga yuborishdan oldin tekshirish uchun).
             # ?sana=YYYY-MM-DD, berilmasa - kecha. ?tur=smena - sana 08:00 dan
@@ -712,6 +728,62 @@ def holat_xabari(conn, device, event_type, event_ts, hozir):
     if hozir - event_ts > KECHIKKAN_VOQEA_S:
         qatorlar.append("⏳ kechikib keldi (aloqa uzilgan edi)")
     return chr(10).join(qatorlar)
+
+
+def voqea_json(r):
+    """cycle_events qatori (event_time_local, event_type, motosoat, event_ts,
+    received_at) -> JSON. received_at - SQLite datetime('now'), ya'ni UTC.
+    Qurilma aloqa yo'q paytda voqeani saqlab, keyin yuborsa, kechikish shu
+    ikki vaqt farqidan ko'rinadi (Telegram'dagi "⏳" bilan bir xil qoida)."""
+    d = {"vaqt": r[0], "holat": r[1], "motosoat": r[2]}
+    try:
+        qabul_ts = calendar.timegm(time.strptime(r[4], "%Y-%m-%d %H:%M:%S"))
+        kech = max(0, qabul_ts - int(r[3]))
+        d["qabul_qilingan"] = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(qabul_ts + UZ_OFFSET))
+        d["kechikish_daqiqa"] = kech // 60
+        d["kechikkan"] = kech > KECHIKKAN_VOQEA_S
+    except Exception:
+        d["qabul_qilingan"] = None
+        d["kechikish_daqiqa"] = None
+        d["kechikkan"] = None
+    return d
+
+
+HOLAT_NOMI = {1: "ishladi", 0: "toxtagan"}
+
+
+def timeline_json(conn, device, sana, tur="kun"):
+    """Bir zavodning 24 soatlik holati: bir xil (holat, manba) daqiqalar
+    bo'laklarga yig'iladi. Bugungi kunning kelajak qismi qaytarilmaydi."""
+    boshi = local_midnight_utc_ts(sana) + (SMENA_BOSHI_SOAT * 3600 if tur == "smena" else 0)
+    st = hisobot.kun_statistikasi(conn, db_lock, device, boshi,
+                                  lambda d, a, b: compute_hours_range(conn, d, a, b))
+
+    def vaqt(daq):
+        return time.strftime("%Y-%m-%d %H:%M", time.gmtime(boshi + daq * 60 + UZ_OFFSET))
+
+    bolaklar = []
+    holat, manba = st["holat"], st["manba"]
+    i = 0
+    while i < 1440:
+        j = i
+        while j < 1440 and holat[j] == holat[i] and manba[j] == manba[i]:
+            j += 1
+        if holat[i] in HOLAT_NOMI:
+            bolaklar.append({"boshi": vaqt(i), "oxiri": vaqt(j),
+                             "holat": HOLAT_NOMI[holat[i]], "manba": manba[i]})
+        i = j
+    return {
+        "zavod": device,
+        "tur": tur,
+        "boshi": vaqt(0),
+        "oxiri": vaqt(1440),
+        "ishlagan": hisobot.soat_daqiqa(st["soat"]),
+        "ishlagan_soat": round(st["soat"], 3),
+        "bolaklar": bolaklar,
+        "belgilar": [{"vaqt": vaqt(m), "tur": "yondi" if t == "ON" else "ochdi"}
+                     for m, t in st["belgilar"]],
+    }
 
 
 def kechagi_sana(hozir=None):

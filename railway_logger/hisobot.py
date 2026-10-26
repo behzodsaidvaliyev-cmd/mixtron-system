@@ -89,6 +89,8 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
     hozir_daq = int((time.time() - kun_boshi) // 60)
     oxirgi = min(1440, max(hozir_daq, 0))       # bugungi kunning kelajagi bo'yalmaydi
     holat = list(daq)
+    # har daqiqa holati qayerdan olingani: olchov / voqea / motosoat
+    manba = ["olchov" if h is not None else None for h in daq]
     i = 0
     while i < oxirgi:
         if holat[i] is not None:
@@ -106,6 +108,7 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
                     joriy = ichida[n][1]
                     n += 1
                 holat[k] = joriy
+                manba[k] = "voqea"
             i = j
             continue
         oldin = mot_oxiri[i - 1] if i > 0 else (oldingi_row[0] if oldingi_row else None)
@@ -118,6 +121,7 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
             qiymat = holat[j] if j < 1440 and holat[j] is not None else 0
         for k in range(i, j):
             holat[k] = qiymat
+            manba[k] = "motosoat"
         i = j
 
     return {
@@ -125,6 +129,7 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
         "soat": hours_fn(device, kun_boshi, kun_oxiri),
         "belgilar": _belgilar(holat),
         "holat": holat,
+        "manba": manba,
     }
 
 
