@@ -55,8 +55,9 @@ SILENCE_CHECK_S = int(os.environ.get("SILENCE_CHECK_S", "60"))    # tekshirish o
 SILENCE_FORGET_S = 7 * 86400        # shuncha vaqt ko'rinmagan qurilma kuzatilmaydi
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-# "MIXTRON ZAVOD HOLATI" kanali: zavod yondi/o'chdi va aloqa uzilishi xabarlari.
-# Shaxsiy chatga (TELEGRAM_CHAT_ID) jimlik ogohlantirishlari eskidek boradi.
+# "MIXTRON ZAVOD HOLATI" kanali: zavod yondi/o'chdi xabarlari va hisobotlar.
+# Aloqa uzilishi ogohlantirishlari faqat shaxsiy chatga (TELEGRAM_CHAT_ID) boradi -
+# foydalanuvchi so'rovi bilan kanaldan olib tashlangan (2026-10-26).
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 KECHIKKAN_VOQEA_S = 300     # voqea bundan kech kelsa "kechikib keldi" deb belgilanadi
 
@@ -872,14 +873,9 @@ def jimlik_kuzatuvchisi(conn):
                         "⚠ {} - {} daqiqadan beri ma'lumot yo'q".format(
                             zavod, h["jim_daqiqa"])
                         + chr(10) + "Oxirgi ma'lumot: " + h["oxirgi"])
-                    kanalga_yubor(
-                        "🟡 {} — {} daqiqadan beri svet yo'q yoki internet uzilgan".format(
-                            zavod_nomi(zavod), h["jim_daqiqa"])
-                        + chr(10) + "Oxirgi ma'lumot: " + h["oxirgi"][11:16])
                 elif (not h["jim"]) and oldin:
                     _jim_belgilangan[zavod] = False
                     telegram_yubor("✅ {} - aloqa tiklandi".format(zavod))
-                    kanalga_yubor("✅ {} — aloqa tiklandi".format(zavod_nomi(zavod)))
         except Exception as e:
             print("[OGOH] kuzatuvda xato:", e)
 
