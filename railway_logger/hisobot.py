@@ -35,6 +35,16 @@ YASHIL = (46, 204, 113)
 QIZIL = (231, 76, 60)
 KULRANG = (78, 90, 106)
 CHIZIQ = (55, 66, 82)
+ALOQASIZ = (60, 70, 84)          # shtrix foni
+ALOQASIZ_SHTRIX = (110, 122, 138)
+SARIQ = (241, 196, 15)
+
+# Holat qiymatlari: 1 = ishladi, 0 = to'xtagan, ALOQA_YOQ = datchik bilan aloqa
+# uzilgan va hali tiklanmagan (holat noma'lum), None = o'lchov yo'q (kelajak).
+ALOQA_YOQ = -1
+# Oxirgi o'lchovdan keyin shuncha daqiqa jimlik bo'lsa - aloqa yo'q deb olinadi
+# (/holat dagi jimlik chegarasi bilan bir xil).
+JIM_CHEGARA_DAQ = 10
 
 
 def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
@@ -47,9 +57,16 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
             (device, kun_boshi, kun_oxiri),
         ).fetchall()
         oldingi_row = conn.execute(
-            "SELECT motosoat FROM readings WHERE device = ? AND received_ts < ? "
+            "SELECT motosoat, received_ts FROM readings WHERE device = ? AND received_ts < ? "
             "ORDER BY received_ts DESC LIMIT 1",
             (device, kun_boshi),
+        ).fetchone()
+        # Oraliqdan keyingi birinchi o'lchov: oxirgi bo'shliq oraliq chegarasida
+        # tugasa, aloqa keyin tiklanganmi va motosoat qancha o'sganini bilish uchun.
+        keyingi_row = conn.execute(
+            "SELECT motosoat FROM readings WHERE device = ? AND received_ts >= ? "
+            "ORDER BY received_ts LIMIT 1",
+            (device, kun_oxiri),
         ).fetchone()
         # Qurilma aloqa yo'q paytda ON/OFF voqealarini o'z xotirasida aniq vaqti
         # bilan saqlaydi va aloqa tiklanganda yuboradi - bo'shliqlar shular bilan
@@ -89,8 +106,9 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
     hozir_daq = int((time.time() - kun_boshi) // 60)
     oxirgi = min(1440, max(hozir_daq, 0))       # bugungi kunning kelajagi bo'yalmaydi
     holat = list(daq)
-    # har daqiqa holati qayerdan olingani: olchov / voqea / motosoat
+    # har daqiqa holati qayerdan olingani: olchov / voqea / motosoat / aloqa_yoq
     manba = ["olchov" if h is not None else None for h in daq]
+    aloqasiz_ts = None
     i = 0
     while i < oxirgi:
         if holat[i] is not None:
@@ -112,7 +130,30 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
             i = j
             continue
         oldin = mot_oxiri[i - 1] if i > 0 else (oldingi_row[0] if oldingi_row else None)
-        keyin = mot_boshi[j] if j < 1440 else None
+        if j < oxirgi:
+            keyin = mot_boshi[j]
+        elif j >= 1440 and keyingi_row:
+            keyin = keyingi_row[0]
+        else:
+            keyin = None
+        if keyin is None and j >= oxirgi and j - i >= JIM_CHEGARA_DAQ:
+            # Bo'shliqdan keyin hech qanday o'lchov yo'q - aloqa uzilgan va hali
+            # tiklanmagan. Oxirgi holatni cho'zmaymiz: zavod ishlaganmi yoki
+            # yo'qmi noma'lum (2026-10-26 zavod2: 16:08 dan jim, chiziq esa
+            # ertalabgacha "ishladi" bo'lib, jami 7:20 bilan zid edi).
+            for k in range(i, j):
+                holat[k] = ALOQA_YOQ
+                manba[k] = "aloqa_yoq"
+            # oxirgi o'lchov vaqti (oraliqdan oldin jim bo'lib qolgan bo'lsa ham)
+            oxirgi_ts = [ts for ts, _, _ in rows if ts < kun_boshi + i * 60]
+            if oxirgi_ts:
+                aloqasiz_ts = oxirgi_ts[-1]
+            elif oldingi_row:
+                aloqasiz_ts = oldingi_row[1]
+            else:
+                aloqasiz_ts = kun_boshi
+            i = j
+            continue
         if oldin is not None and keyin is not None:
             qiymat = 1 if (keyin - oldin) * 60 >= 0.5 * (j - i) else 0
         elif i > 0:
@@ -130,6 +171,8 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
         "belgilar": _belgilar(holat),
         "holat": holat,
         "manba": manba,
+        # aloqa uzilib tiklanmagan bo'lsa - oxirgi o'lchovning UTC timestamp'i, aks holda None
+        "aloqasiz_ts": aloqasiz_ts,
     }
 
 
@@ -198,6 +241,23 @@ def _hm(ts):
     return time.strftime("%H:%M", time.gmtime(ts + UZ_OFFSET))
 
 
+def _aloqasiz_matn(ts):
+    """'aloqa yo'q 26.10 16:08 dan' - oxirgi o'lchov vaqti bilan."""
+    return "aloqa yo'q " + time.strftime("%d.%m %H:%M", time.gmtime(ts + UZ_OFFSET)) + " dan"
+
+
+def _shtrix(d, x0, y0, x1, y1):
+    """Aloqa yo'q oralig'i: to'q fon ustida qiya chiziqlar."""
+    d.rectangle((x0, y0, x1, y1), fill=ALOQASIZ)
+    h = y1 - y0
+    x = x0 - h
+    while x < x1:
+        a, b = max(x, x0), min(x + h, x1)
+        # chiziq (x, y1) -> (x+h, y0), oraliq chegarasida kesiladi
+        d.line((a, y1 - (a - x), b, y1 - (b - x)), fill=ALOQASIZ_SHTRIX, width=2)
+        x += 12
+
+
 def _zavod_nomi(device):
     return "Zavod " + device[5:] if device.startswith("zavod") else device
 
@@ -247,8 +307,12 @@ def rasm_chizish(statlar, sana_matn, sarlavha="kunlik hisobot", boshlanish_daq=0
            font=f_sarlavha, fill=MATN)
     d.text((pad, 104), sana_matn, font=f_kichik, fill=XIRA)
 
+    aloqasiz_bor = any(s.get("aloqasiz_ts") for s in statlar)
     jt = "Jami: " + soat_daqiqa(sum(s["soat"] for s in statlar))
-    d.text((W - pad - d.textlength(jt, font=f_qiymat), 108), jt, font=f_qiymat, fill=MATN)
+    if aloqasiz_bor:
+        jt += " (to'liq emas)"
+    d.text((W - pad - d.textlength(jt, font=f_qiymat), 108), jt, font=f_qiymat,
+           fill=SARIQ if aloqasiz_bor else MATN)
 
     # rang izohi
     lx, ly = pad, 156
@@ -256,6 +320,10 @@ def rasm_chizish(statlar, sana_matn, sarlavha="kunlik hisobot", boshlanish_daq=0
         d.rounded_rectangle((lx, ly + 4, lx + 22, ly + 22), radius=4, fill=rang)
         d.text((lx + 32, ly), nom, font=f_belgi, fill=XIRA)
         lx += 50 + d.textlength(nom, font=f_belgi)
+    if aloqasiz_bor:
+        _shtrix(d, lx, ly + 4, lx + 22, ly + 22)
+        d.text((lx + 32, ly), "aloqa yo'q", font=f_belgi, fill=XIRA)
+        lx += 50 + d.textlength("aloqa yo'q", font=f_belgi)
     for rang, nom in ((YASHIL, "yondi"), (QIZIL, "o'chdi")):
         d.text((lx, ly - 1), nom, font=f_vaqt, fill=rang)
         lx += 30 + d.textlength(nom, font=f_vaqt)
@@ -267,7 +335,14 @@ def rasm_chizish(statlar, sana_matn, sarlavha="kunlik hisobot", boshlanish_daq=0
 
         d.text((x0 + 28, y + 24), _zavod_nomi(s["zavod"]), font=f_nom, fill=MATN)
         st = soat_daqiqa(s["soat"])
-        d.text((x1 - 28 - d.textlength(st, font=f_katta), y + 14), st, font=f_katta, fill=YASHIL)
+        if s.get("aloqasiz_ts"):
+            # Aloqa uzilib tiklanmagan: oraliq oxirigacha holat noma'lum - yakuniy son yo'q
+            ms = "Ma'lumot shakllanmadi"
+            d.text((x1 - 28 - d.textlength(ms, font=f_nom), y + 24), ms, font=f_nom, fill=SARIQ)
+            iz = "tasdiqlangan: " + st + " · " + _aloqasiz_matn(s["aloqasiz_ts"])
+            d.text((x1 - 28 - d.textlength(iz, font=f_belgi), y + 70), iz, font=f_belgi, fill=XIRA)
+        else:
+            d.text((x1 - 28 - d.textlength(st, font=f_katta), y + 14), st, font=f_katta, fill=YASHIL)
 
         # 24 soatlik vaqt chizig'i
         tx0, tx1 = x0 + 28, x1 - 28
@@ -288,6 +363,14 @@ def rasm_chizish(statlar, sana_matn, sarlavha="kunlik hisobot", boshlanish_daq=0
             rang = {1: YASHIL, 0: KULRANG}.get(h)
             if rang:
                 d.rectangle((x_of(i), ty0, x_of(j), ty1), fill=rang)
+            elif h == ALOQA_YOQ:
+                _shtrix(d, x_of(i), ty0, x_of(j), ty1)
+                yozuv = "Datchik bilan aloqa yo'q"
+                yw = d.textlength(yozuv, font=f_belgi)
+                if x_of(j) - x_of(i) > yw + 16:
+                    cx = (x_of(i) + x_of(j)) / 2
+                    d.rectangle((cx - yw / 2 - 6, ty0 + 9, cx + yw / 2 + 6, ty1 - 9), fill=ALOQASIZ)
+                    d.text((cx - yw / 2, ty0 + 9), yozuv, font=f_belgi, fill=MATN)
             i = j
 
         # yonish/o'chish vaqtlari chiziq ustida. Avval hamma ko'rsatkich
@@ -321,6 +404,13 @@ def izoh_matni(statlar, sana_matn):
     """Rasm ostidagi qisqa matn (Telegram caption)."""
     q = ["📊 Kunlik hisobot — " + sana_matn]
     for s in statlar:
-        q.append("{}: {}".format(_zavod_nomi(s["zavod"]), soat_daqiqa(s["soat"])))
-    q.append("Jami: " + soat_daqiqa(sum(s["soat"] for s in statlar)))
+        if s.get("aloqasiz_ts"):
+            q.append("{}: ma'lumot shakllanmadi (tasdiqlangan {}, {})".format(
+                _zavod_nomi(s["zavod"]), soat_daqiqa(s["soat"]), _aloqasiz_matn(s["aloqasiz_ts"])))
+        else:
+            q.append("{}: {}".format(_zavod_nomi(s["zavod"]), soat_daqiqa(s["soat"])))
+    jami = "Jami: " + soat_daqiqa(sum(s["soat"] for s in statlar))
+    if any(s.get("aloqasiz_ts") for s in statlar):
+        jami += " (to'liq emas)"
+    q.append(jami)
     return "\n".join(q)

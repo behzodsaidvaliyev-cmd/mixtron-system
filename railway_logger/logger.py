@@ -749,7 +749,7 @@ def voqea_json(r):
     return d
 
 
-HOLAT_NOMI = {1: "ishladi", 0: "toxtagan"}
+HOLAT_NOMI = {1: "ishladi", 0: "toxtagan", hisobot.ALOQA_YOQ: "aloqa_yoq"}
 
 
 def timeline_json(conn, device, sana, tur="kun"):
@@ -780,6 +780,9 @@ def timeline_json(conn, device, sana, tur="kun"):
         "oxiri": vaqt(1440),
         "ishlagan": hisobot.soat_daqiqa(st["soat"]),
         "ishlagan_soat": round(st["soat"], 3),
+        # aloqa uzilib tiklanmagan bo'lsa - oxirgi o'lchov vaqti; ishlagan soat to'liq emas
+        "aloqa_yoq_dan": (time.strftime("%Y-%m-%d %H:%M", time.gmtime(st["aloqasiz_ts"] + UZ_OFFSET))
+                          if st["aloqasiz_ts"] else None),
         "bolaklar": bolaklar,
         "belgilar": [{"vaqt": vaqt(m), "tur": "yondi" if t == "ON" else "ochdi"}
                      for m, t in st["belgilar"]],
