@@ -134,6 +134,12 @@ def get_conn():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_device_ts ON cycle_events (device, event_ts)")
     # Kunlik hisobot qaysi sana uchun yuborilgani - qayta ishga tushganda takrorlanmasin
     conn.execute("CREATE TABLE IF NOT EXISTS hisobot_yuborilgan (sana TEXT PRIMARY KEY, yuborilgan_ts INTEGER)")
+    # Shubhali deb kanalga yuborilmay, shaxsiy chatga ushlab qolingan hisobotlar
+    conn.execute("CREATE TABLE IF NOT EXISTS hisobot_ushlangan (kalit TEXT PRIMARY KEY, ts INTEGER, sabab TEXT)")
+    # Telegramga ketgan (yoki to'xtatilgan) har bir xabar - nazorat uchun
+    conn.execute("CREATE TABLE IF NOT EXISTS telegram_jurnal ("
+                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, tur TEXT, matn TEXT, natija TEXT)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tg_jurnal_ts ON telegram_jurnal (ts)")
     conn.commit()
 
     # eski yozuvlarda received_ts bo'sh qolgan - received_at matnidan orqaga qarab to'ldiramiz
@@ -227,16 +233,36 @@ def get_conn():
     return conn
 
 
+def broker_nomi(host):
+    return "hivemq" if "hivemq" in host else "mixtron-broker"
+
+
+# Nazorat uchun: qurilma oxirgi marta qaysi brokerdan keldi (zaxira HiveMQ'da
+# qolib ketsa ko'rinsin) va logger brokerlarga ulanganmi.
+_oxirgi_broker = {}        # zavod -> (broker, birinchi_ts, oxirgi_ts)
+_mqtt_ulangan = {}         # broker -> (ulanganmi, ts)
+
+
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[MQTT] connected ({}), rc =".format(userdata.get("broker")), rc)
+    _mqtt_ulangan[broker_nomi(userdata["broker"])] = (True, int(time.time()))
     client.subscribe(DATA_TOPIC_FILTER)
     client.subscribe(EVENTS_TOPIC_FILTER)
+
+
+def on_disconnect(client, userdata, flags, rc, properties=None):
+    print("[MQTT] disconnected ({}), rc =".format(userdata.get("broker")), rc)
+    _mqtt_ulangan[broker_nomi(userdata["broker"])] = (False, int(time.time()))
 
 
 def on_message(client, userdata, msg):
     conn = userdata["conn"]
     device = msg.topic.split("/")[0]
     line = msg.payload.decode("utf-8", "ignore")
+    hozir = int(time.time())
+    br = broker_nomi(userdata["broker"])
+    oldin = _oxirgi_broker.get(device)
+    _oxirgi_broker[device] = (br, oldin[1] if oldin and oldin[0] == br else hozir, hozir)
 
     if line.startswith("DATA|"):
         try:
@@ -699,9 +725,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 sana = params.get("sana", [None])[0] or kechagi_sana()
                 if params.get("tur", [""])[0] == "smena":
-                    png, _ = smena_hisoboti(conn, sana)
+                    png = smena_hisoboti(conn, sana)[0]
                 else:
-                    png, _ = kunlik_hisobot(conn, sana)
+                    png = kunlik_hisobot(conn, sana)[0]
             except Exception as e:
                 self._send_error(400, e)
                 return
@@ -712,11 +738,80 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(png)
 
         elif parsed.path == "/holat":
+            zavodlar = jimlik_holati(conn)
+            for h in zavodlar:
+                br = _oxirgi_broker.get(h["zavod"])
+                h["broker"] = br[0] if br else None
             self._send_json({
                 "chegara_daqiqa": SILENCE_LIMIT_S // 60,
-                "zavodlar": jimlik_holati(conn),
+                "zavodlar": zavodlar,
             })
 
+        elif parsed.path == "/nazorat":
+            # Nazorat jamlanmasi. ?soat=12 (1-72) - oxirgi necha soat.
+            try:
+                soat = min(72, max(1, int(params.get("soat", ["12"])[0])))
+                self._send_json(nazorat_json(conn, soat))
+            except Exception as e:
+                self._send_error(400, e)
+
+        elif parsed.path == "/hisobot_yubor":
+            # Ushlangan hisobotni ko'rib, tugma bilan kanalga yuborish. GET
+            # hech narsa yubormaydi (havolani oldindan ochadigan dasturlar
+            # tasodifan yuborib qo'ymasin) - faqat POST yuboradi.
+            if not self._token_togri(params):
+                self._send_error(404, "not found")
+                return
+            kalit = params.get("kalit", [""])[0]
+            sana = kalit[6:] if kalit.startswith("smena:") else kalit
+            tur = "&tur=smena" if kalit.startswith("smena:") else ""
+            body = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                    "<h3>{k} hisobot</h3><img src='/hisobot.png?sana={s}{t}' style='max-width:100%'>"
+                    "<form method=post><input type=hidden name=kalit value='{k}'>"
+                    "<input type=hidden name=token value='{tok}'>"
+                    "<p><button style='font-size:20px;padding:10px 20px'>Kanalga yuborish</button></form>").format(
+                        k=quote(kalit, safe=":-"), s=quote(sana), t=tur, tok=quote(params["token"][0]))
+            self._send_html(body)
+
+        else:
+            self._send_error(404, "not found")
+
+    def _token_togri(self, params):
+        return bool(NAZORAT_TOKEN) and hmac.compare_digest(params.get("token", [""])[0], NAZORAT_TOKEN)
+
+    def _send_html(self, body):
+        body = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        uzunlik = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+        params = parse_qs(self.rfile.read(uzunlik).decode("utf-8", "ignore"))
+        conn = self.server.db_conn
+        if not self._token_togri(params):
+            self._send_error(404, "not found")
+            return
+        if parsed.path == "/hisobot_yubor":
+            kalit = params.get("kalit", [""])[0]
+            try:
+                ok = hisobotni_kanalga_yubor(conn, kalit)
+            except Exception as e:
+                self._send_error(400, e)
+                return
+            self._send_html("<!doctype html><meta charset=utf-8><h3>{} - {}</h3>".format(
+                kalit, "kanalga yuborildi" if ok else "YUBORILMADI (jurnalni ko'ring)"))
+        elif parsed.path == "/nazorat/xulosa":
+            # Claude tahlili natijasi - shaxsiy chatga.
+            matn = params.get("matn", [""])[0].strip()
+            if not matn:
+                self._send_error(400, "matn bo'sh")
+                return
+            ok = telegram_yubor("🤖 Claude nazorati" + chr(10) + matn[:3900], TELEGRAM_CHAT_ID)
+            self._send_json({"yuborildi": ok})
         else:
             self._send_error(404, "not found")
 
@@ -724,11 +819,61 @@ class Handler(BaseHTTPRequestHandler):
         pass  # standart konsolni shovqindan tozalash
 
 
-def telegram_yubor(matn, chat_id=None):
-    """Xabar Telegramga yuboriladi. Sozlanmagan bo'lsa xizmat baribir ishlaydi -
-    xabar faqat jurnalga tushadi, shunda sozlashdan oldin sinab ko'rish mumkin."""
-    chat_id = chat_id or TELEGRAM_CHAT_ID
-    print("[OGOH]" if chat_id == TELEGRAM_CHAT_ID else "[KANAL]", matn.replace(chr(10), " | "))
+# --- Telegram toshqiniga qarshi chegara va jurnal ---
+# Xato tufayli (masalan aloqa tiklanganda eski voqealar oqimi) kanalga
+# o'nlab xabar ketib qolmasin: bir soatda chegaradan oshgani to'xtatiladi
+# va shaxsiy chatga BITTA ogohlantirish boradi. Har bir xabar (yuborilgan,
+# xato bergan yoki to'xtatilgan) telegram_jurnal jadvaliga yoziladi.
+TG_SOATLIK_CHEGARA = {
+    "kanal": int(os.environ.get("KANAL_SOATLIK_CHEGARA", "12")),
+    "ogoh": int(os.environ.get("OGOH_SOATLIK_CHEGARA", "30")),
+}
+_tg_lock = threading.Lock()
+_tg_yuborilgan = {"kanal": [], "ogoh": []}     # oxirgi soatda yuborilganlar vaqti
+_tg_toxtatilgan = {}                           # tur -> oxirgi "to'xtatildi" ogohlantirishi
+_jurnal_conn = None                            # main() da o'rnatiladi
+
+
+def _tg_tur(chat_id):
+    return "kanal" if TELEGRAM_CHANNEL_ID and str(chat_id) == str(TELEGRAM_CHANNEL_ID) else "ogoh"
+
+
+def _jurnal(tur, matn, natija):
+    if _jurnal_conn is None:
+        return
+    try:
+        with db_lock:
+            _jurnal_conn.execute("INSERT INTO telegram_jurnal (ts, tur, matn, natija) VALUES (?, ?, ?, ?)",
+                                 (int(time.time()), tur, matn[:1500], natija))
+            _jurnal_conn.commit()
+    except Exception as e:
+        print("[JURNAL] yozilmadi:", e)
+
+
+def _tg_ruxsat(tur, matn):
+    """Chegaradan oshmagan bo'lsa True. Oshgan bo'lsa xabar jurnalga
+    "chegara" bo'lib yoziladi va soatiga bir marta shaxsiy chatga aytiladi."""
+    hozir = time.time()
+    with _tg_lock:
+        oxirgi = [t for t in _tg_yuborilgan[tur] if hozir - t < 3600]
+        _tg_yuborilgan[tur] = oxirgi
+        if len(oxirgi) < TG_SOATLIK_CHEGARA[tur]:
+            oxirgi.append(hozir)
+            return True
+        aytish = hozir - _tg_toxtatilgan.get(tur, 0) >= 3600
+        if aytish:
+            _tg_toxtatilgan[tur] = hozir
+    print("[TOSHQIN] {} chegarasi ({}/soat) - xabar to'xtatildi: {}".format(
+        tur, TG_SOATLIK_CHEGARA[tur], matn.replace(chr(10), " | ")[:200]))
+    _jurnal(tur, matn, "chegara")
+    if aytish:
+        ogoh = "⛔ {} 1 soatda {} tadan ko'p xabar - qolganlari 1 soat to'xtatildi.{}Birinchisi: {}".format(
+            "Kanalga" if tur == "kanal" else "Shaxsiy chatga", TG_SOATLIK_CHEGARA[tur], chr(10), matn[:300])
+        _jurnal("ogoh", ogoh, "ok" if _tg_jonat(ogoh, TELEGRAM_CHAT_ID) else "xato")
+    return False
+
+
+def _tg_jonat(matn, chat_id):
     if not (TELEGRAM_TOKEN and chat_id):
         return False
     try:
@@ -740,6 +885,21 @@ def telegram_yubor(matn, chat_id=None):
     except Exception as e:
         print("[OGOH] Telegramga yuborilmadi:", e)
         return False
+
+
+def telegram_yubor(matn, chat_id=None):
+    """Xabar Telegramga yuboriladi. Sozlanmagan bo'lsa xizmat baribir ishlaydi -
+    xabar faqat jurnalga tushadi, shunda sozlashdan oldin sinab ko'rish mumkin."""
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    tur = _tg_tur(chat_id)
+    print("[OGOH]" if tur == "ogoh" else "[KANAL]", matn.replace(chr(10), " | "))
+    if not (TELEGRAM_TOKEN and chat_id):
+        return False
+    if not _tg_ruxsat(tur, matn):
+        return False
+    ok = _tg_jonat(matn, chat_id)
+    _jurnal(tur, matn, "ok" if ok else "xato")
+    return ok
 
 
 # --- Voqea yo'qolsa ham kanalga xabar ketishi (o'lchovdan) ---
@@ -945,7 +1105,7 @@ def kunlik_hisobot(conn, sana):
     t = time.strptime(sana, "%Y-%m-%d")
     qisqa = time.strftime("%d.%m.%Y", t)
     return (hisobot.rasm_chizish(statlar, qisqa + ", " + HAFTA_KUNLARI[t.tm_wday]),
-            hisobot.izoh_matni(statlar, qisqa))
+            hisobot.izoh_matni(statlar, qisqa), statlar)
 
 
 def smena_hisoboti(conn, sana):
@@ -962,13 +1122,23 @@ def smena_hisoboti(conn, sana):
         time.strftime("%d.%m", t1), SMENA_BOSHI_SOAT, time.strftime("%d.%m.%Y", t2), SMENA_BOSHI_SOAT)
     return (hisobot.rasm_chizish(statlar, oraliq, sarlavha="smena hisoboti",
                                  boshlanish_daq=SMENA_BOSHI_SOAT * 60),
-            hisobot.izoh_matni(statlar, oraliq))
+            hisobot.izoh_matni(statlar, oraliq), statlar)
 
 
 def telegram_rasm(png, izoh, chat_id):
     """sendPhoto - multipart/form-data, faqat standart kutubxona bilan."""
     if not (TELEGRAM_TOKEN and chat_id):
         return False
+    tur = _tg_tur(chat_id)
+    yozuv = "[rasm] " + (izoh or "hisobot")
+    if not _tg_ruxsat(tur, yozuv):
+        return False
+    ok = _tg_rasm_jonat(png, izoh, chat_id)
+    _jurnal(tur, yozuv, "ok" if ok else "xato")
+    return ok
+
+
+def _tg_rasm_jonat(png, izoh, chat_id):
     chegara = "----mixtron" + str(int(time.time() * 1000))
     qismlar = []
     maydonlar = [("chat_id", str(chat_id))]
@@ -1002,6 +1172,152 @@ def _hisobot_turlari():
     )
 
 
+# --- Shubhali hisobotni kanalga chiqarmaslik ---
+# 2026-10-31: zavod2 uchun "84 soat ishladi" hisobot kanalga chiqib ketdi.
+# Hisobotdagi soat motosoatdan, chiziq esa daqiqalik holatdan hisoblanadi -
+# ikkalasi bir-biriga mos kelishi kerak. 18.10-31.10 ma'lumotida oddiy
+# kunlarda farq 0-17 daqiqa; xato kunlarda (zavod1 float32 davri, zavod2
+# 31.10, zavod3 21.10) 66-124 daqiqa. Shubhali hisobot shaxsiy chatga
+# ketadi va tasdiqlanmaguncha kanalga chiqmaydi.
+SHUBHA_FARQ_DAQ = int(os.environ.get("SHUBHA_FARQ_DAQ", "45"))
+NAZORAT_TOKEN = os.environ.get("NAZORAT_TOKEN", "")
+
+
+def hisobot_shubhalari(statlar):
+    sabablar = []
+    for s in statlar:
+        nom = zavod_nomi(s["zavod"])
+        soat = s["soat"]
+        if soat < 0 or soat > 24.01:
+            sabablar.append("{}: {} ishladi - 24 soatdan ko'p".format(nom, hisobot.soat_daqiqa(soat)))
+            continue
+        chiziq = sum(1 for h in s["holat"] if h == 1)
+        farq = soat * 60 - chiziq
+        if abs(farq) > SHUBHA_FARQ_DAQ:
+            sabablar.append("{}: raqamda {}, chiziqda {} ({:+d} daq)".format(
+                nom, hisobot.soat_daqiqa(soat), hisobot.soat_daqiqa(chiziq / 60), int(round(farq))))
+    return sabablar
+
+
+def _yuborish_havolasi(kalit):
+    domen = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if not (domen and NAZORAT_TOKEN):
+        return ""
+    return "https://{}/hisobot_yubor?{}".format(domen, urlencode({"kalit": kalit, "token": NAZORAT_TOKEN}))
+
+
+def hisobotni_ushla(conn, kalit, nom, png, sabablar):
+    """Hisobot kanal o'rniga shaxsiy chatga sabablar bilan yuboriladi."""
+    izoh = chr(10).join(["⚠ Shubhali {} hisobot ({}) - KANALGA YUBORILMADI".format(nom, kalit)]
+                        + sabablar)
+    havola = _yuborish_havolasi(kalit)
+    if havola:
+        izoh += chr(10) + "Tekshirib, baribir kanalga yuborish: " + havola
+    print("[HISOBOT] ushlab qolindi:", kalit, "|", " | ".join(sabablar))
+    if telegram_rasm(png, izoh[:1024], TELEGRAM_CHAT_ID):
+        with db_lock:
+            conn.execute("INSERT OR REPLACE INTO hisobot_ushlangan VALUES (?, ?, ?)",
+                         (kalit, int(time.time()), " | ".join(sabablar)))
+            conn.commit()
+
+
+def hisobotni_kanalga_yubor(conn, kalit):
+    """Ushlangan (yoki istalgan) hisobotni qo'lda kanalga yuborish. kalit -
+    'YYYY-MM-DD' (kunlik) yoki 'smena:YYYY-MM-DD'."""
+    if kalit.startswith("smena:"):
+        png = smena_hisoboti(conn, kalit[6:])[0]
+    else:
+        png = kunlik_hisobot(conn, kalit)[0]
+    if not telegram_rasm(png, "", TELEGRAM_CHANNEL_ID):
+        return False
+    with db_lock:
+        conn.execute("INSERT OR REPLACE INTO hisobot_yuborilgan VALUES (?, ?)", (kalit, int(time.time())))
+        conn.execute("DELETE FROM hisobot_ushlangan WHERE kalit = ?", (kalit,))
+        conn.commit()
+    print("[HISOBOT] qo'lda kanalga yuborildi:", kalit)
+    return True
+
+
+def nazorat_json(conn, soat=12):
+    """mixtron-nazorat servisi va Claude tahlili uchun bitta jamlanma:
+    har zavod bo'yicha o'lchovlar sifati, voqealar, broker, Telegram jurnali,
+    hisobotlar holati. soat - oxirgi necha soat."""
+    hozir = int(time.time())
+    dan = hozir - soat * 3600
+
+    def mahalliy(ts):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts + UZ_OFFSET)) if ts else None
+
+    jim = {h["zavod"]: h for h in jimlik_holati(conn, hozir)}
+    zavodlar = []
+    for z in HISOBOT_ZAVODLAR:
+        with db_lock:
+            rows = conn.execute(
+                "SELECT received_ts, status, watt, motosoat FROM readings "
+                "WHERE device = ? AND received_ts >= ? ORDER BY received_ts", (z, dan)).fetchall()
+            ev = conn.execute(
+                "SELECT event_time_local, event_type, motosoat, event_ts, received_at FROM cycle_events "
+                "WHERE device = ? AND (event_ts >= ? OR received_at >= datetime(?, 'unixepoch')) "
+                "ORDER BY event_ts", (z, dan, dan)).fetchall()
+        orqaga, sakrash, boshliq = [], [], []
+        for (t1, _, _, m1), (t2, _, _, m2) in zip(rows, rows[1:]):
+            dt = (t2 - t1) / 3600
+            dm = (m2 or 0) - (m1 or 0)
+            if dm < -0.001:
+                orqaga.append({"vaqt": mahalliy(t2), "oldin": m1, "keyin": m2})
+            elif dm > dt * 1.05 + 0.02:
+                sakrash.append({"vaqt": mahalliy(t2), "oraliq_daq": round(dt * 60, 1), "motosoat_osdi_soat": round(dm, 3)})
+            if t2 - t1 > 300:
+                boshliq.append({"dan": mahalliy(t1), "gacha": mahalliy(t2), "daq": int((t2 - t1) // 60)})
+        on_w = sorted(r[2] for r in rows if r[1] == "ON" and r[2] is not None)
+        off_w = [r[2] for r in rows if r[1] == "OFF" and r[2] is not None]
+        voqealar = []
+        for r in ev:
+            d = voqea_json(r)
+            try:
+                farq = calendar.timegm(time.strptime(r[4], "%Y-%m-%d %H:%M:%S")) - int(r[3])
+                d["qabul_minus_voqea_s"] = farq     # manfiy - qurilma soati oldinda
+            except Exception:
+                pass
+            voqealar.append(d)
+        br = _oxirgi_broker.get(z)
+        zavodlar.append({
+            "zavod": z,
+            "oxirgi_olchov": jim.get(z, {}).get("oxirgi"),
+            "jim_daqiqa": jim.get(z, {}).get("jim_daqiqa"),
+            "broker": br[0] if br else None,
+            "broker_dan": mahalliy(br[1]) if br else None,
+            "olchovlar_soni": len(rows),
+            "on_soni": len(on_w),
+            "off_soni": len(off_w),
+            "on_watt": {"min": on_w[0], "median": on_w[len(on_w) // 2], "max": on_w[-1]} if on_w else None,
+            "off_watt_max": max(off_w) if off_w else None,
+            "motosoat_boshi": rows[0][3] if rows else None,
+            "motosoat_oxiri": rows[-1][3] if rows else None,
+            "motosoat_orqaga": orqaga[:20],
+            "motosoat_sakrash": sakrash[:20],
+            "boshliqlar_5daq_dan": boshliq[:50],
+            "voqealar": voqealar[-100:],
+            "boot_soni": sum(1 for r in ev if r[1] == "BOOT"),
+        })
+    with db_lock:
+        jurnal = conn.execute(
+            "SELECT ts, tur, matn, natija FROM telegram_jurnal WHERE ts >= ? ORDER BY ts", (dan,)).fetchall()
+        yuborilgan = conn.execute(
+            "SELECT sana, yuborilgan_ts FROM hisobot_yuborilgan ORDER BY yuborilgan_ts DESC LIMIT 8").fetchall()
+        ushlangan = conn.execute(
+            "SELECT kalit, ts, sabab FROM hisobot_ushlangan ORDER BY ts DESC LIMIT 8").fetchall()
+    return {
+        "hozir": mahalliy(hozir),
+        "oraliq_soat": soat,
+        "mqtt": {b: {"ulangan": u, "dan": mahalliy(t)} for b, (u, t) in _mqtt_ulangan.items()},
+        "zavodlar": zavodlar,
+        "telegram": [{"vaqt": mahalliy(t), "tur": tu, "matn": m, "natija": n} for t, tu, m, n in jurnal[-300:]],
+        "hisobotlar_yuborilgan": [{"kalit": k, "vaqt": mahalliy(t)} for k, t in yuborilgan],
+        "hisobotlar_ushlangan": [{"kalit": k, "vaqt": mahalliy(t), "sabab": s} for k, t, s in ushlangan],
+    }
+
+
 def hisobot_kuzatuvchisi(conn):
     """Fon oqimi: har kuni kunlik (00:02) va smena (08:01) hisobotlarini
     kanalga BIR MARTADAN yuboradi. Ikkalasi ham kechagi sana bo'yicha: kunlik -
@@ -1029,10 +1345,15 @@ def hisobot_kuzatuvchisi(conn):
                 kalit = kalit_fn(sana)
                 with db_lock:
                     bor = conn.execute("SELECT 1 FROM hisobot_yuborilgan WHERE sana = ?", (kalit,)).fetchone()
-                if bor:
+                    ushlangan = conn.execute("SELECT 1 FROM hisobot_ushlangan WHERE kalit = ?", (kalit,)).fetchone()
+                if bor or ushlangan:
                     continue
                 oxirgi_urinish[nom] = hozir
-                png, _ = yasovchi(conn, sana)
+                png, _, statlar = yasovchi(conn, sana)
+                sabablar = hisobot_shubhalari(statlar)
+                if sabablar:
+                    hisobotni_ushla(conn, kalit, nom, png, sabablar)
+                    continue
                 # rasm matnsiz yuboriladi - foydalanuvchi so'rovi (hamma narsa rasmda)
                 if telegram_rasm(png, "", TELEGRAM_CHANNEL_ID):
                     with db_lock:
@@ -1141,8 +1462,10 @@ def bazani_urug_dan_olish():
 
 
 def main():
+    global _jurnal_conn
     bazani_urug_dan_olish()
     conn = get_conn()
+    _jurnal_conn = conn
 
     http_thread = threading.Thread(target=run_http_server, args=(conn,), daemon=True)
     http_thread.start()
@@ -1181,6 +1504,7 @@ def mqtt_tsikli(conn, broker, port, tls, qoshimcha):
     if tls:
         client.tls_set()
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
     while True:
