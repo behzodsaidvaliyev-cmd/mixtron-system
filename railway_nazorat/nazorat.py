@@ -29,6 +29,7 @@ HIVEMQ_CHEGARA_DAQ = 60              # proshivka 30 daqiqada o'z brokerga qaytis
 BOOT_CHEGARA = 4                     # 2 soatda shuncha qayta yuklanish - g'alati
 SOAT_FARQ_S = 600                    # qurilma soati shuncha oldinda bo'lsa
 TG_XATO_CHEGARA = 3
+MOTOSOAT_ORQAGA_SOAT = 0.05              # 3 daqiqa
 
 
 def mahalliy(ts=None, fmt="%Y-%m-%d %H:%M"):
@@ -102,6 +103,10 @@ def muammolar(j, hozir):
             m[nom + ":boot"] = ("{} oxirgi {} soatda {} marta qayta yuklandi".format(
                 nom, j.get("oraliq_soat"), z["boot_soni"]), True)
         for o in z.get("motosoat_orqaga") or []:
+            # qayta yuklanishda 20-30 s orqaga qaytish odatiy (motosoat xotiraga
+            # kechikib saqlanadi) - faqat MOTOSOAT_ORQAGA_SOAT dan ko'pi aytiladi
+            if (o["oldin"] or 0) - (o["keyin"] or 0) < MOTOSOAT_ORQAGA_SOAT:
+                continue
             m["{}:orqaga:{}".format(nom, o["vaqt"])] = (
                 "{} motosoat ORQAGA ketdi {}: {} -> {}".format(nom, o["vaqt"], o["oldin"], o["keyin"]), False)
         for s in z.get("motosoat_sakrash") or []:
