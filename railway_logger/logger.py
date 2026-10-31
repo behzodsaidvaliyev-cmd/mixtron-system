@@ -60,6 +60,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # foydalanuvchi so'rovi bilan kanaldan olib tashlangan (2026-10-26).
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 KECHIKKAN_VOQEA_S = 300     # voqea bundan kech kelsa "kechikib keldi" deb belgilanadi
+# Bundan eski ON/OFF kanalga YUBORILMAYDI (bazaga baribir yoziladi, hisobotlarda
+# ko'rinadi). 2026-10-31 zavod2 5 kunlik aloqasizlikdan keyin 34 ta eski voqeani
+# birdan yubordi - kanal ularga to'lib ketmasin (foydalanuvchi so'rovi).
+KANAL_ESKI_CHEGARA_S = int(os.environ.get("KANAL_ESKI_CHEGARA_S", str(2 * 3600)))
 
 # Kunlik infografika hisobot (hisobot.py): har kuni shu vaqtda o'tgan kun uchun
 HISOBOT_VAQTI = os.environ.get("HISOBOT_VAQTI", "00:02")
@@ -760,7 +764,12 @@ def _chiqqanmi(device, tur, ts):
 
 def kanalga_holat_yubor(conn, device, tur, event_ts, hozir):
     """ON/OFF xabarini kanalga BIR MARTA yuboradi (voqea yoki o'lchov - qaysi
-    biri birinchi kelsa)."""
+    biri birinchi kelsa). KANAL_ESKI_CHEGARA_S dan eski voqea yuborilmaydi."""
+    if hozir - event_ts > KANAL_ESKI_CHEGARA_S:
+        print("[KANAL] {} {} ({}) - {} daqiqa eski, kanalga yuborilmadi".format(
+            device, tur, time.strftime("%Y-%m-%d %H:%M", time.gmtime(event_ts + UZ_OFFSET)),
+            int((hozir - event_ts) // 60)))
+        return
     with _qoriq_lock:
         _kutilayotgan[:] = [k for k in _kutilayotgan
                             if not (k[0] == device and k[1] == tur and abs(k[2] - event_ts) <= KANAL_TAKROR_S)]
