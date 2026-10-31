@@ -497,6 +497,33 @@ def run_all():
           len(rp) == 5 and rp[4] == "rc=3" and int(rp[1]) > 0, str(resolved))
     check("WDT ishga tushmadi", "WDT" not in out, out)
 
+    # =====================================================================
+    print("\n=== 20. Zaxira brokerda qolib ketmaydi - 30 daqiqada o'z brokerga qaytadi ===")
+    W.__init__()
+    new_device(tmp)
+    own = "mixtron-broker-production.up.railway.app"
+    W.broker_down_until = {own: 300}     # 5 daqiqa yopiq, keyin tiklanadi
+    out = boot(2400)                     # BITTA yoqilish - qayta yuklanishsiz
+    hive_i = W.connected_hosts.index("b.hivemq.cloud") if "b.hivemq.cloud" in W.connected_hosts else -1
+    check("o'z broker yopiq paytda HiveMQ'ga o'tdi", hive_i >= 0, str(W.connected_hosts[:3]))
+    check("keyin (qayta yuklanishsiz) o'z brokerga qaytdi",
+          hive_i >= 0 and own in W.connected_hosts[hive_i:], str(W.connected_hosts[:4]))
+    check("WDT/qayta yuklanish yo'q", out == "tugadi", out)
+
+    # =====================================================================
+    print("\n=== 21. Qaytishda o'z broker hali yo'q - darhol zaxiraga qaytadi ===")
+    W.__init__()
+    new_device(tmp)
+    W.broker_hosts = {own: "down"}
+    W.connect_attempts = []
+    out = boot(2400)
+    own_tries = W.connect_attempts.count(own)
+    check("o'z brokerga faqat boshida 3 marta + qaytishda 1 marta urinildi", own_tries == 4,
+          "{} marta: {}".format(own_tries, [h[:6] for h in W.connect_attempts]))
+    d19 = data_lines()
+    check("ma'lumot uzluksiz ketdi (HiveMQ orqali)", len(d19) > 300, "{} ta".format(len(d19)))
+    check("WDT/qayta yuklanish yo'q", out == "tugadi", out)
+
     print("\n" + "=" * 62)
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     total = len(RESULTS)

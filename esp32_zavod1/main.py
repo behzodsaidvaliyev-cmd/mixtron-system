@@ -50,6 +50,10 @@ MQTT_PORT = 8883
 OWN_BROKER = "mixtron-broker-production.up.railway.app"   # WebSocket, 443
 OWN_PORT = 443
 BROKER_SWITCH_AFTER_FAILS = 3
+# Zaxira (HiveMQ) brokerda qolib ketmaslik uchun: shuncha vaqtdan keyin o'z
+# brokerimizga bir marta qayta urinib ko'riladi. 2026-10-29 da zavod3 o'z
+# broker bir zum yopilganda HiveMQ'ga o'tib, ikki kun o'sha yerda qolgan edi.
+PRIMARY_RETRY_S = 1800
 MQTT_KEEPALIVE = 60
 MQTT_TOPIC = DEVICE + "/data"
 MQTT_EVENTS_TOPIC = DEVICE + "/events"
@@ -1109,10 +1113,11 @@ class WSMQTTClient(MQTTClient):
 
 _broker_idx = 0         # 0 - o'z brokerimiz, 1 - mqtt_config.json dagisi
 _broker_fails = 0
+_fallback_since = 0     # zaxira brokerga qachon o'tilgan (uptime_s)
 
 
 def mqtt_connect():
-    global _broker_idx, _broker_fails
+    global _broker_idx, _broker_fails, _fallback_since
     if not CONFIG_OK:
         raise RuntimeError("mqtt_config.json yo'q/buzuq - MQTT ishlamaydi")
     brokers = ((OWN_BROKER, OWN_PORT), (MQTT_BROKER, MQTT_PORT))
@@ -1124,10 +1129,41 @@ def mqtt_connect():
         if _broker_fails >= BROKER_SWITCH_AFTER_FAILS:
             _broker_fails = 0
             _broker_idx = 1 - _broker_idx
+            _fallback_since = uptime_s()
             print("[MQTT] boshqa brokerga o'tiladi:", brokers[_broker_idx][0])
         raise
     _broker_fails = 0
     return client
+
+
+def maybe_return_to_primary(client):
+    """Zaxira brokerda PRIMARY_RETRY_S dan ko'p turgan bo'lsa ulanish yopiladi
+    va keyingi ulanish o'z brokerimizga BIR MARTA sinaladi: o'xshamasa,
+    _broker_fails chegarada turgani uchun darhol zaxiraga qaytiladi."""
+    global _broker_idx, _broker_fails, _fallback_since
+    if client is None or _broker_idx != 1:
+        return client
+    if uptime_s() - _fallback_since < PRIMARY_RETRY_S:
+        return client
+    print("[MQTT] zaxira brokerda uzoq qolindi - o'z brokerga qayta urinilmoqda")
+    _broker_idx = 0
+    _broker_fails = BROKER_SWITCH_AFTER_FAILS - 1
+    _fallback_since = uptime_s()
+    return mqtt_close(client)
+
+
+def publish_event(client, out):
+    """ON/OFF voqeasi. O'z brokerda QoS 1: broker PUBACK bilan tasdiqlamaguncha
+    publish xato beradi va voqea navbatda qoladi (keyin qayta yuboriladi).
+    2026-10-31 zavod3 ning ON voqeasi QoS 0 bilan yarim uzilgan ulanishga
+    ketib yo'qolgan edi. Takroriy voqeani server o'tkazib yuboradi.
+    HiveMQ (oddiy umqtt TLS soketi) da QoS 0 qoladi: u yerda setblocking(True)
+    vaqt chegarasini bekor qiladi va PUBACK kutish abadiy qotib qolishi mumkin;
+    WSStream esa o'qishni TLS soketining o'z vaqt chegarasi bilan qiladi."""
+    if isinstance(client, WSMQTTClient):
+        client.publish(MQTT_EVENTS_TOPIC, out, qos=1)
+    else:
+        client.publish(MQTT_EVENTS_TOPIC, out)
 
 
 def _mqtt_connect_to(host, port):
@@ -1374,7 +1410,7 @@ def flush_event_queue(client):
                 try:
                     if not net_write_ready(client):
                         raise OSError("soket yozishga tayyor emas")
-                    client.publish(MQTT_EVENTS_TOPIC, out)
+                    publish_event(client, out)
                     restore_socket_timeout(client)
                     sent += 1
                 except Exception as e:
@@ -1672,6 +1708,7 @@ def main():
             # --- MQTT'ga yuborish ---
             if now - last_publish >= PUBLISH_INTERVAL_S:
                 last_publish = now
+                client = maybe_return_to_primary(client)
                 if client is None and wifi_is_up():
                     try:
                         client = mqtt_connect()

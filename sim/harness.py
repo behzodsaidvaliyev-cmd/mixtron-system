@@ -39,6 +39,7 @@ class World:
         self.ntp_bad = False          # NTP 2036 aylanishi: 136 yil xato vaqt
         self.broker = "ok"            # ok | down | hang
         self.broker_hosts = {}        # manzil -> ok | down | hang (ustun turadi)
+        self.broker_down_until = {}   # manzil -> uptime soniya: shu vaqtgacha "down"
         self.connect_attempts = []    # qaysi brokerga ulanishga urinildi
         self.connected_hosts = []     # qaysi brokerga ulandi
         self.pzem = "ok"              # ok | dead
@@ -385,6 +386,9 @@ class FakeMQTTClient:
     def _state(self):
         # Har bir broker manzili uchun alohida holat (W.broker_hosts), aks
         # holda umumiy W.broker ishlatiladi.
+        until = W.broker_down_until.get(self.server)
+        if until is not None and W.mono < until:
+            return "down"                # shu (uptime) vaqtgacha yopiq
         return W.broker_hosts.get(self.server, W.broker)
 
     def set_callback(self, cb):
