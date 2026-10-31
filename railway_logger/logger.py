@@ -245,6 +245,7 @@ def on_message(client, userdata, msg):
                 )
                 conn.commit()
             print("[DB] saved ({}): {}".format(device, line))
+            holat_otishini_kuzat(conn, device, status, float(motosoat), int(time.time()))
         except Exception as e:
             print("[DB] parse/save error:", e, "line:", line)
 
@@ -270,18 +271,30 @@ def on_message(client, userdata, msg):
                 event_ts = now
             event_time_local = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(event_ts + UZ_OFFSET))
             with db_lock:
-                conn.execute(
-                    "INSERT INTO cycle_events (device, event_ts, event_time_local, event_type, motosoat) VALUES (?, ?, ?, ?, ?)",
-                    (device, event_ts, event_time_local, event_type, float(motosoat)),
-                )
-                conn.commit()
+                # Proshivka voqeani QoS 1 bilan yuboradi: PUBACK yo'qolsa bir xil
+                # voqea qayta keladi. Bir xil (zavod, vaqt, tur) ikkinchi marta
+                # yozilmaydi va kanalga ham qayta chiqmaydi.
+                bor = conn.execute(
+                    "SELECT 1 FROM cycle_events WHERE device = ? AND event_ts = ? AND event_type = ?",
+                    (device, event_ts, event_type),
+                ).fetchone()
+                if not bor:
+                    conn.execute(
+                        "INSERT INTO cycle_events (device, event_ts, event_time_local, event_type, motosoat) VALUES (?, ?, ?, ?, ?)",
+                        (device, event_ts, event_time_local, event_type, float(motosoat)),
+                    )
+                    conn.commit()
+            if bor:
+                print("[EVENT] takroriy ({}): {} at {} - o'tkazib yuborildi".format(
+                    device, event_type, event_time_local))
+                return
             # Qo'shimcha maydonlar (masalan BOOT uchun "rc=3" - qayta yuklanish
             # sababi: 1 quvvat/brownout, 2 dastur o'zi (machine.reset), 3 WDT) faqat logda ko'rinadi.
             print("[EVENT] saved ({}): {} at {} (mahalliy vaqt) motosoat = {}{}".format(
                 device, event_type, event_time_local, motosoat,
                 " " + " ".join(parts[4:]) if len(parts) > 4 else ""))
             if event_type in ("ON", "OFF"):          # BOOT - qurilma yoqilgani, drobilka ishi emas
-                kanalga_yubor(holat_xabari(conn, device, event_type, event_ts, now))
+                kanalga_holat_yubor(conn, device, event_type, event_ts, now)
         except Exception as e:
             print("[EVENT] parse/save error:", e, "line:", line)
 
@@ -697,6 +710,96 @@ def telegram_yubor(matn, chat_id=None):
         return False
 
 
+# --- Voqea yo'qolsa ham kanalga xabar ketishi (o'lchovdan) ---
+# 2026-10-31: zavod3 13:17 da aloqasiz paytda yondi; ON voqeasi QoS 0 bilan
+# yarim uzilgan ulanishga yuborilib yo'qoldi va kanalga hech narsa chiqmadi,
+# vaholanki jonli o'lchovlarda OFF->ON aniq ko'rindi. Endi o'lchovdagi holat
+# o'tishi kuzatiladi: VOQEA_KUTISH_S ichida mos voqea kelmasa, xabar
+# o'lchov asosida yuboriladi. Bir zavod/turdagi xabar KANAL_TAKROR_S ichida
+# faqat bir marta chiqadi - voqea keyin kechikib kelsa ham.
+VOQEA_KUTISH_S = 120
+KANAL_TAKROR_S = 600
+_qoriq_lock = threading.Lock()
+_oxirgi_olchov = {}        # zavod -> (status, ts, motosoat)
+_kutilayotgan = []         # [zavod, tur, taxminiy_ts, muddat]
+_kanalga_chiqqan = []      # [(zavod, tur, ts)] - oxirgi kunlar
+
+
+def _chiqqanmi(device, tur, ts):
+    return any(d == device and t == tur and abs(x - ts) <= KANAL_TAKROR_S
+               for d, t, x in _kanalga_chiqqan)
+
+
+def kanalga_holat_yubor(conn, device, tur, event_ts, hozir):
+    """ON/OFF xabarini kanalga BIR MARTA yuboradi (voqea yoki o'lchov - qaysi
+    biri birinchi kelsa)."""
+    with _qoriq_lock:
+        _kutilayotgan[:] = [k for k in _kutilayotgan
+                            if not (k[0] == device and k[1] == tur and abs(k[2] - event_ts) <= KANAL_TAKROR_S)]
+        if _chiqqanmi(device, tur, event_ts):
+            return
+        _kanalga_chiqqan.append((device, tur, event_ts))
+        chegara = hozir - 3 * 86400
+        _kanalga_chiqqan[:] = [c for c in _kanalga_chiqqan if c[2] > chegara]
+    kanalga_yubor(holat_xabari(conn, device, tur, event_ts, hozir))
+
+
+def holat_otishini_kuzat(conn, device, status, motosoat, hozir):
+    """Har DATA'da chaqiriladi: OFF<->ON o'tishi bo'lsa kutish ro'yxatiga qo'yadi.
+    Aloqa uzilgan oraliqda o'tish bo'lsa vaqt motosoatdan taxmin qilinadi:
+    yonganda - hozir minus shu oraliqda ishlagan vaqt, o'chganda - oraliq boshi
+    plyus ishlagan vaqt."""
+    if status not in ("ON", "OFF"):
+        return
+    oldin = _oxirgi_olchov.get(device)
+    if oldin is None:
+        with db_lock:
+            r = conn.execute(
+                "SELECT status, received_ts, motosoat FROM readings WHERE device = ? AND received_ts < ? "
+                "ORDER BY received_ts DESC LIMIT 1", (device, hozir)).fetchone()
+        oldin = tuple(r) if r else None
+    _oxirgi_olchov[device] = (status, hozir, motosoat)
+    if not oldin or oldin[0] == status or oldin[0] not in ("ON", "OFF"):
+        return
+    o_status, o_ts, o_mot = oldin
+    ishlagan_s = max(0.0, (motosoat - (o_mot or motosoat)) * 3600)
+    if hozir - o_ts > 60:                      # orada o'lchov kelmagan
+        if status == "ON":
+            taxmin = hozir - ishlagan_s
+        else:
+            taxmin = o_ts + ishlagan_s
+        taxmin = int(min(max(taxmin, o_ts), hozir))
+    else:
+        taxmin = hozir
+    with _qoriq_lock:
+        _kutilayotgan.append([device, status, taxmin, hozir + VOQEA_KUTISH_S])
+
+
+def voqea_qoriqchisi(conn):
+    """Fon oqimi: muddati o'tgan, mos voqeasi kelmagan o'tishlar uchun
+    kanalga o'lchov asosida xabar yuboradi."""
+    while True:
+        time.sleep(15)
+        try:
+            hozir = int(time.time())
+            with _qoriq_lock:
+                tayyor = [k for k in _kutilayotgan if k[3] <= hozir]
+                _kutilayotgan[:] = [k for k in _kutilayotgan if k[3] > hozir]
+            for device, tur, taxmin, _ in tayyor:
+                with db_lock:
+                    bor = conn.execute(
+                        "SELECT 1 FROM cycle_events WHERE device = ? AND event_type = ? "
+                        "AND event_ts BETWEEN ? AND ?",
+                        (device, tur, taxmin - KANAL_TAKROR_S, taxmin + KANAL_TAKROR_S)).fetchone()
+                if bor:
+                    continue
+                print("[KANAL] {} {} voqeasi kelmadi - o'lchov bo'yicha yuborildi ({})".format(
+                    device, tur, time.strftime("%H:%M:%S", time.gmtime(taxmin + UZ_OFFSET))))
+                kanalga_holat_yubor(conn, device, tur, taxmin, hozir)
+        except Exception as e:
+            print("[KANAL] qoriqchida xato:", e)
+
+
 def kanalga_yubor(matn):
     """Kanalga ALOHIDA oqimda yuboradi: Telegram sekin javob bersa ham MQTT
     xabarlarini qabul qilish va bazaga yozish to'xtab qolmasin."""
@@ -1011,6 +1114,7 @@ def main():
     ogoh_thread.start()
 
     threading.Thread(target=hisobot_kuzatuvchisi, args=(conn,), daemon=True).start()
+    threading.Thread(target=voqea_qoriqchisi, args=(conn,), daemon=True).start()
 
     # Ikkinchi broker (o'zimizning mixtron-broker, ichki tarmoq). Qurilmalar
     # ulardan biriga yuboradi - avval o'zimiznikiga, u ishlamasa HiveMQ'ga -
