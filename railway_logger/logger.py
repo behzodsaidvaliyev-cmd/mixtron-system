@@ -318,26 +318,54 @@ def local_str_to_utc_ts(value):
 
 
 def motosoat_at(conn, device, target_utc_ts):
-    """Berilgan zavod uchun, berilgan vaqtga eng yaqin (undan oldingi) motosoat qiymatini topadi."""
-    with db_lock:
-        row = conn.execute(
-            "SELECT motosoat FROM readings WHERE device = ? AND received_ts <= ? ORDER BY received_ts DESC LIMIT 1",
-            (device, target_utc_ts),
-        ).fetchone()
-        if row:
-            return row[0]
+    """Berilgan zavod uchun berilgan vaqtdagi motosoat qiymati.
 
-        row2 = conn.execute(
-            "SELECT motosoat FROM readings WHERE device = ? AND received_ts >= ? ORDER BY received_ts ASC LIMIT 1",
-            (device, target_utc_ts),
-        ).fetchone()
-        return row2[0] if row2 else 0.0
+    Odatda - shu vaqtdan oldingi eng yaqin o'lchov. Lekin vaqt aloqa uzilgan
+    oraliqqa tushsa (yaqin o'lchov yo'q), oldingi o'lchovni olish noto'g'ri:
+    2026-10-31 zavod2 5 kun aloqasiz qolgan edi - 31.10 00:00 uchun 26.10 dagi
+    o'lchov olinib, besh kunlik ish (84 soat) bitta kunga yozilgan. Shuning
+    uchun oraliq ichida qurilma keyin yuborgan ON/OFF/BOOT voqealari ham
+    hisobga olinadi (ular aniq vaqt va motosoat olib keladi) va qiymat eng
+    yaqin ikki nuqta orasida chiziqli hisoblanadi. ON va OFF orasida motosoat
+    tekis o'sadi, OFF va ON orasida o'zgarmaydi - ikkala holda ham aniq."""
+    with db_lock:
+        oldin = conn.execute(
+            "SELECT received_ts, motosoat FROM readings WHERE device = ? AND received_ts <= ? "
+            "ORDER BY received_ts DESC LIMIT 1", (device, target_utc_ts)).fetchone()
+        if oldin and target_utc_ts - oldin[0] <= MOTOSOAT_YAQIN_S:
+            return oldin[1]
+        keyin = conn.execute(
+            "SELECT received_ts, motosoat FROM readings WHERE device = ? AND received_ts >= ? "
+            "ORDER BY received_ts ASC LIMIT 1", (device, target_utc_ts)).fetchone()
+        # Uzilish oralig'i ichidagi voqealar (qurilma keyin yuborgan)
+        pastki = oldin[0] if oldin else 0
+        yuqori = keyin[0] if keyin else 2 ** 62
+        v_oldin = conn.execute(
+            "SELECT event_ts, motosoat FROM cycle_events WHERE device = ? AND event_ts > ? AND event_ts <= ? "
+            "ORDER BY event_ts DESC LIMIT 1", (device, pastki, target_utc_ts)).fetchone()
+        v_keyin = conn.execute(
+            "SELECT event_ts, motosoat FROM cycle_events WHERE device = ? AND event_ts >= ? AND event_ts < ? "
+            "ORDER BY event_ts ASC LIMIT 1", (device, target_utc_ts, yuqori)).fetchone()
+    a = v_oldin or oldin
+    b = v_keyin or keyin
+    if a and b:
+        if b[0] <= a[0] or b[1] < a[1]:
+            return a[1]
+        return a[1] + (b[1] - a[1]) * (target_utc_ts - a[0]) / (b[0] - a[0])
+    if a:
+        return a[1]
+    return b[1] if b else 0.0
+
+
+MOTOSOAT_YAQIN_S = 120      # o'lchov shundan yaqin bo'lsa - oraliq emas, o'sha olinadi
 
 
 def compute_hours_range(conn, device, from_ts, to_ts):
     start_motosoat = motosoat_at(conn, device, from_ts)
     end_motosoat = motosoat_at(conn, device, to_ts)
-    return max(0.0, end_motosoat - start_motosoat)
+    # Oraliq uzunligidan ko'p ishlash mumkin emas - qandaydir ma'lumot xatosi
+    # (masalan eski proshivka, soat sakrashi) bo'lsa ham hisobot buzilmasin.
+    return min(max(0.0, end_motosoat - start_motosoat), max(0.0, (to_ts - from_ts) / 3600.0))
 
 
 def compute_hours_today(conn, device):
