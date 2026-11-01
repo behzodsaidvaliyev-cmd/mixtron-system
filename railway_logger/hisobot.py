@@ -204,7 +204,9 @@ def _voqea_ishini_tekshir(holat, manba, i, j, voqea_mot, chegara):
     mumkin: 2026-10-31 zavod2 17:33 YONDI - 19:50 O'CHDI orasida motosoat atigi
     55 daqiqa o'sgan, chiziq esa 2:16 ni yashil bo'yab, hisobot raqami (10:11)
     bilan 82 daqiqaga zid chiqqan. Motosoat bo'lakdan kamroq o'sgan bo'lsa,
-    bo'lak boshidan motosoatcha "ishladi" qoladi, qolgani ALOQA_YOQ (noma'lum)."""
+    bo'lak boshidan motosoatcha "ishladi" qoladi, qolgani "to'xtagan": motosoat
+    faqat drobilka aylanganda o'sadi, demak qolgan vaqtda u turgan (fakt).
+    Qaysi daqiqalarda turgani ma'lum emas - jami vaqt aniq, joyi taxminiy."""
     oldin, keyin = chegara
     a = i
     while a < j:
@@ -220,8 +222,8 @@ def _voqea_ishini_tekshir(holat, manba, i, j, voqea_mot, chegara):
             haqiqiy = max(0, int(round((oxir - bosh) * 60)))
             if haqiqiy < (b - a) - VOQEA_TOLERANS_DAQ:
                 for k in range(a + haqiqiy, b):
-                    holat[k] = ALOQA_YOQ
-                    manba[k] = "aloqa_yoq"
+                    holat[k] = 0
+                    manba[k] = "motosoat"
         a = b
 
 
@@ -369,9 +371,7 @@ def rasm_chizish(statlar, sana_matn, sarlavha="kunlik hisobot", boshlanish_daq=0
         d.rounded_rectangle((lx, ly + 4, lx + 22, ly + 22), radius=4, fill=rang)
         d.text((lx + 32, ly), nom, font=f_belgi, fill=XIRA)
         lx += 50 + d.textlength(nom, font=f_belgi)
-    # shtrix kun oxiridagi uzilishdan tashqari, motosoat tasdiqlamagan
-    # oraliqda ham chiziladi (_voqea_ishini_tekshir) - izohi ikkalasida ham kerak
-    if aloqasiz_bor or any(ALOQA_YOQ in s["holat"] for s in statlar):
+    if aloqasiz_bor:
         _shtrix(d, lx, ly + 4, lx + 22, ly + 22)
         d.text((lx + 32, ly), "aloqa yo'q", font=f_belgi, fill=XIRA)
         lx += 50 + d.textlength("aloqa yo'q", font=f_belgi)
