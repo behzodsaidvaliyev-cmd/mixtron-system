@@ -72,7 +72,7 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
         # bilan saqlaydi va aloqa tiklanganda yuboradi - bo'shliqlar shular bilan
         # bo'yaladi. BOOT olinmaydi (qurilma yoqilgani, drobilka ishi emas).
         voqealar = conn.execute(
-            "SELECT event_ts, event_type FROM cycle_events "
+            "SELECT event_ts, event_type, motosoat FROM cycle_events "
             "WHERE device = ? AND event_ts >= ? AND event_ts < ? AND event_type IN ('ON','OFF') "
             "ORDER BY event_ts",
             (device, kun_boshi, kun_oxiri),
@@ -94,7 +94,12 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
                 mot_boshi[i] = mot
             mot_oxiri[i] = mot
 
-    voqea_daq = [(int((ts - kun_boshi) // 60), 1 if t == "ON" else 0) for ts, t in voqealar]
+    voqea_daq = [(int((ts - kun_boshi) // 60), 1 if t == "ON" else 0) for ts, t, _ in voqealar]
+    voqea_mot = {}             # daqiqa -> shu daqiqadagi voqea motosoati
+    for ts, _, mot in voqealar:
+        i = int((ts - kun_boshi) // 60)
+        if 0 <= i < 1440 and mot is not None:
+            voqea_mot.setdefault(i, mot)
 
     # O'lchov kelmagan daqiqalar (aloqa uzilishi, qayta ulanish) to'ldiriladi:
     # 1) bo'shliq ichida qurilmaning saqlangan ON/OFF voqealari bo'lsa - holat
@@ -127,6 +132,8 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
                     n += 1
                 holat[k] = joriy
                 manba[k] = "voqea"
+            _voqea_ishini_tekshir(holat, manba, i, j, voqea_mot,
+                                  _chegara_motosoat(i, j, mot_oxiri, mot_boshi, oldingi_row, keyingi_row, oxirgi))
             i = j
             continue
         oldin = mot_oxiri[i - 1] if i > 0 else (oldingi_row[0] if oldingi_row else None)
@@ -174,6 +181,48 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
         # aloqa uzilib tiklanmagan bo'lsa - oxirgi o'lchovning UTC timestamp'i, aks holda None
         "aloqasiz_ts": aloqasiz_ts,
     }
+
+
+def _chegara_motosoat(i, j, mot_oxiri, mot_boshi, oldingi_row, keyingi_row, oxirgi):
+    """Bo'shliq [i, j) dan oldingi va keyingi ma'lum motosoat (yo'q bo'lsa None)."""
+    oldin = mot_oxiri[i - 1] if i > 0 else (oldingi_row[0] if oldingi_row else None)
+    if j < oxirgi:
+        keyin = mot_boshi[j]
+    elif j >= 1440 and keyingi_row:
+        keyin = keyingi_row[0]
+    else:
+        keyin = None
+    return oldin, keyin
+
+
+VOQEA_TOLERANS_DAQ = 5
+
+
+def _voqea_ishini_tekshir(holat, manba, i, j, voqea_mot, chegara):
+    """Voqealar bilan bo'yalgan bo'shliqdagi har "ishladi" bo'lagini motosoat
+    bilan tekshiradi. Datchik aloqasiz paytda ba'zi voqealarni saqlamay qolishi
+    mumkin: 2026-10-31 zavod2 17:33 YONDI - 19:50 O'CHDI orasida motosoat atigi
+    55 daqiqa o'sgan, chiziq esa 2:16 ni yashil bo'yab, hisobot raqami (10:11)
+    bilan 82 daqiqaga zid chiqqan. Motosoat bo'lakdan kamroq o'sgan bo'lsa,
+    bo'lak boshidan motosoatcha "ishladi" qoladi, qolgani ALOQA_YOQ (noma'lum)."""
+    oldin, keyin = chegara
+    a = i
+    while a < j:
+        if holat[a] != 1:
+            a += 1
+            continue
+        b = a
+        while b < j and holat[b] == 1:
+            b += 1
+        bosh = voqea_mot.get(a, oldin if a == i else None)
+        oxir = voqea_mot.get(b, keyin if b == j else None)
+        if bosh is not None and oxir is not None:
+            haqiqiy = max(0, int(round((oxir - bosh) * 60)))
+            if haqiqiy < (b - a) - VOQEA_TOLERANS_DAQ:
+                for k in range(a + haqiqiy, b):
+                    holat[k] = ALOQA_YOQ
+                    manba[k] = "aloqa_yoq"
+        a = b
 
 
 QISQA_TOXTASH_DAQ = 5       # bundan qisqa to'xtash chiziqda ko'rinadi, lekin vaqti yozilmaydi

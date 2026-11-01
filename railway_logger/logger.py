@@ -917,8 +917,19 @@ _kutilayotgan = []         # [zavod, tur, taxminiy_ts, muddat]
 _kanalga_chiqqan = []      # [(zavod, tur, ts)] - oxirgi kunlar
 
 
+def _xuddi_shu_otish(device, tur, ts, x, royxat):
+    """x vaqtdagi shu turdagi xabar ts dagisi bilan BIR o'tishmi: yaqin va
+    orasida qarama-qarshi xabar yo'q. 2026-11-01 zavod1: 13:56 O'CHDI, 13:56
+    YONDI, 13:58 O'CHDI - oddiy 10 daqiqalik oyna 13:58 dagisini takror deb
+    tashlab yuborgan, kanalda ketma-ket ikki YONDI qolgan."""
+    if abs(x - ts) > KANAL_TAKROR_S:
+        return False
+    a, b = min(x, ts), max(x, ts)
+    return not any(d == device and t != tur and a < y < b for d, t, y in royxat)
+
+
 def _chiqqanmi(device, tur, ts):
-    return any(d == device and t == tur and abs(x - ts) <= KANAL_TAKROR_S
+    return any(d == device and t == tur and _xuddi_shu_otish(device, tur, ts, x, _kanalga_chiqqan)
                for d, t, x in _kanalga_chiqqan)
 
 
@@ -932,7 +943,8 @@ def kanalga_holat_yubor(conn, device, tur, event_ts, hozir):
         return
     with _qoriq_lock:
         _kutilayotgan[:] = [k for k in _kutilayotgan
-                            if not (k[0] == device and k[1] == tur and abs(k[2] - event_ts) <= KANAL_TAKROR_S)]
+                            if not (k[0] == device and k[1] == tur
+                                    and _xuddi_shu_otish(device, tur, event_ts, k[2], _kanalga_chiqqan))]
         if _chiqqanmi(device, tur, event_ts):
             return
         _kanalga_chiqqan.append((device, tur, event_ts))
@@ -984,11 +996,11 @@ def voqea_qoriqchisi(conn):
                 _kutilayotgan[:] = [k for k in _kutilayotgan if k[3] > hozir]
             for device, tur, taxmin, _ in tayyor:
                 with db_lock:
-                    bor = conn.execute(
-                        "SELECT 1 FROM cycle_events WHERE device = ? AND event_type = ? "
-                        "AND event_ts BETWEEN ? AND ?",
-                        (device, tur, taxmin - KANAL_TAKROR_S, taxmin + KANAL_TAKROR_S)).fetchone()
-                if bor:
+                    yaqin = [(device, t, x) for x, t in conn.execute(
+                        "SELECT event_ts, event_type FROM cycle_events WHERE device = ? "
+                        "AND event_type IN ('ON', 'OFF') AND event_ts BETWEEN ? AND ?",
+                        (device, taxmin - KANAL_TAKROR_S, taxmin + KANAL_TAKROR_S)).fetchall()]
+                if any(t == tur and _xuddi_shu_otish(device, tur, taxmin, x, yaqin) for _, t, x in yaqin):
                     continue
                 print("[KANAL] {} {} voqeasi kelmadi - o'lchov bo'yicha yuborildi ({})".format(
                     device, tur, time.strftime("%H:%M:%S", time.gmtime(taxmin + UZ_OFFSET))))
