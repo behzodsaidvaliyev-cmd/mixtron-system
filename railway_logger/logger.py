@@ -230,7 +230,64 @@ def get_conn():
         conn.commit()
         print("[DB] jami {} ta voqea sanasi aniqlashtirildi".format(tuzatildi))
 
+    # Elektr uzilishidagi OFF voqealari (BOOT yonida yozilgan) - vaqti motosoatdan.
+    # Tuzatilgandan keyin OFF BOOT yonida qolmaydi, demak qayta ishga
+    # tushirishda hech narsa o'zgarmaydi.
+    for off_id, device, off_ts, off_mot in conn.execute(
+            "SELECT o.id, o.device, o.event_ts, o.motosoat FROM cycle_events o WHERE o.event_type = 'OFF' "
+            "AND EXISTS (SELECT 1 FROM cycle_events b WHERE b.device = o.device AND b.event_type = 'BOOT' "
+            "AND b.event_ts BETWEEN o.event_ts - ? AND o.event_ts + ?)",
+            (ELEKTR_BOOT_YAQIN_S, ELEKTR_BOOT_YAQIN_S)).fetchall():
+        yangi = elektr_uzilish_vaqti(conn, device, off_ts, off_mot)
+        if yangi is not None:
+            conn.execute("UPDATE cycle_events SET event_ts = ?, event_time_local = ? WHERE id = ?",
+                         (yangi, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(yangi + UZ_OFFSET)), off_id))
+            print("[DB] {} elektr uzilishi: OFF {} -> {} (motosoat bo'yicha)".format(
+                device, time.strftime("%Y-%m-%d %H:%M", time.gmtime(off_ts + UZ_OFFSET)),
+                time.strftime("%H:%M", time.gmtime(yangi + UZ_OFFSET))))
+    conn.commit()
+
     return conn
+
+
+# --- Elektr uzilishi ---
+# Elektr ketganda drobilka ham, ESP32 ham birga o'chadi: ESP32 o'zi o'lik
+# bo'lgani uchun OFF ni yozolmaydi. Elektr kelib ESP32 yonganda xotirasidagi
+# oxirgi holat ON, haqiqiy holat OFF - shu payt (BOOT bilan bir soniyada) OFF
+# yoziladi. Haqiqiy o'chish vaqti motosoatdan topiladi: ESP32 motosoatni har
+# 60 s da xotiraga saqlaydi, demak u elektr ketgan payt (~1 daqiqa aniqlikda)
+# to'xtagan. Oxirgi ma'lum ON nuqtasi + shu orada o'sgan motosoat = o'chish.
+# 2026-10-31 zavod2: ON 17:33 (938.5808), elektr ~18:28, OFF+BOOT 19:50 (939.4947).
+ELEKTR_BOOT_YAQIN_S = 15
+ELEKTR_OLCHOV_ZAXIRA_S = 600
+
+
+def elektr_uzilish_vaqti(conn, device, off_ts, off_mot):
+    """OFF BOOT yonida bo'lsa - motosoat bo'yicha haqiqiy o'chish vaqti, aks holda None."""
+    with db_lock:
+        boot = conn.execute(
+            "SELECT 1 FROM cycle_events WHERE device = ? AND event_type = 'BOOT' AND event_ts BETWEEN ? AND ?",
+            (device, off_ts - ELEKTR_BOOT_YAQIN_S, off_ts + ELEKTR_BOOT_YAQIN_S)).fetchone()
+        if not boot:
+            return None
+        chegara = off_ts - ELEKTR_BOOT_YAQIN_S
+        ev = conn.execute(
+            "SELECT event_ts, event_type, motosoat FROM cycle_events WHERE device = ? "
+            "AND event_type IN ('ON', 'OFF') AND event_ts < ? ORDER BY event_ts DESC LIMIT 1",
+            (device, chegara)).fetchone()
+        # O'lchov vaqti server soati, voqea vaqti ESP32 soati: yonishdan keyingi
+        # birinchi OFF o'lchovi BOOT dan "oldin" bo'lib qolishi mumkin
+        # (2026-10-31 zavod2: o'lchov 19:49, BOOT 19:50:11) - shuning uchun
+        # o'lchovlardan faqat OFF dan 10 daqiqa oldingilari olinadi.
+        rd = conn.execute(
+            "SELECT received_ts, status, motosoat FROM readings WHERE device = ? AND received_ts < ? "
+            "ORDER BY received_ts DESC LIMIT 1", (device, off_ts - ELEKTR_OLCHOV_ZAXIRA_S)).fetchone()
+    oxirgi = max([x for x in (ev, rd) if x], key=lambda x: x[0], default=None)
+    if not oxirgi or oxirgi[1] != "ON" or oxirgi[2] is None or off_mot is None:
+        return None
+    taxmin = oxirgi[0] + max(0.0, off_mot - oxirgi[2]) * 3600
+    taxmin = int(min(max(taxmin, oxirgi[0]), off_ts))
+    return taxmin if off_ts - taxmin > 120 else None
 
 
 def broker_nomi(host):
@@ -299,6 +356,14 @@ def on_message(client, userdata, msg):
             elif event_ts > now + 86400 or event_ts < 1700000000:
                 print("[EVENT] ishonchsiz sana", event_ts, "- server vaqti qo'yildi")
                 event_ts = now
+            elektr = None
+            if event_type == "OFF":
+                elektr = elektr_uzilish_vaqti(conn, device, event_ts, float(motosoat))
+                if elektr is not None:
+                    print("[EVENT] {} elektr uzilishi: OFF {} -> {} (motosoat bo'yicha)".format(
+                        device, time.strftime("%H:%M:%S", time.gmtime(event_ts + UZ_OFFSET)),
+                        time.strftime("%H:%M:%S", time.gmtime(elektr + UZ_OFFSET))))
+                    event_ts = elektr
             event_time_local = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(event_ts + UZ_OFFSET))
             with db_lock:
                 # Proshivka voqeani QoS 1 bilan yuboradi: PUBACK yo'qolsa bir xil
@@ -324,7 +389,10 @@ def on_message(client, userdata, msg):
                 device, event_type, event_time_local, motosoat,
                 " " + " ".join(parts[4:]) if len(parts) > 4 else ""))
             if event_type in ("ON", "OFF"):          # BOOT - qurilma yoqilgani, drobilka ishi emas
-                kanalga_holat_yubor(conn, device, event_type, event_ts, now)
+                kanalga_holat_yubor(conn, device, event_type, event_ts, now,
+                                    "⚡ elektr o'chgan - vaqt motosoatdan" if elektr is not None else "")
+            elif event_type == "BOOT":
+                boot_oldidagi_offni_tuzat(conn, device, event_ts)
         except Exception as e:
             print("[EVENT] parse/save error:", e, "line:", line)
 
@@ -933,7 +1001,27 @@ def _chiqqanmi(device, tur, ts):
                for d, t, x in _kanalga_chiqqan)
 
 
-def kanalga_holat_yubor(conn, device, tur, event_ts, hozir):
+def boot_oldidagi_offni_tuzat(conn, device, boot_ts):
+    """OFF BOOT dan oldin kelib qolgan bo'lsa (navbat tartibi) - vaqtini shu yerda tuzatadi."""
+    with db_lock:
+        off = conn.execute(
+            "SELECT id, event_ts, motosoat FROM cycle_events WHERE device = ? AND event_type = 'OFF' "
+            "AND event_ts BETWEEN ? AND ?",
+            (device, boot_ts - ELEKTR_BOOT_YAQIN_S, boot_ts + ELEKTR_BOOT_YAQIN_S)).fetchone()
+    if not off:
+        return
+    yangi = elektr_uzilish_vaqti(conn, device, off[1], off[2])
+    if yangi is None:
+        return
+    with db_lock:
+        conn.execute("UPDATE cycle_events SET event_ts = ?, event_time_local = ? WHERE id = ?",
+                     (yangi, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(yangi + UZ_OFFSET)), off[0]))
+        conn.commit()
+    print("[EVENT] {} elektr uzilishi (BOOT dan keyin): OFF -> {}".format(
+        device, time.strftime("%H:%M:%S", time.gmtime(yangi + UZ_OFFSET))))
+
+
+def kanalga_holat_yubor(conn, device, tur, event_ts, hozir, qoshimcha=""):
     """ON/OFF xabarini kanalga BIR MARTA yuboradi (voqea yoki o'lchov - qaysi
     biri birinchi kelsa). KANAL_ESKI_CHEGARA_S dan eski voqea yuborilmaydi."""
     if hozir - event_ts > KANAL_ESKI_CHEGARA_S:
@@ -950,7 +1038,8 @@ def kanalga_holat_yubor(conn, device, tur, event_ts, hozir):
         _kanalga_chiqqan.append((device, tur, event_ts))
         chegara = hozir - 3 * 86400
         _kanalga_chiqqan[:] = [c for c in _kanalga_chiqqan if c[2] > chegara]
-    kanalga_yubor(holat_xabari(conn, device, tur, event_ts, hozir))
+    matn = holat_xabari(conn, device, tur, event_ts, hozir)
+    kanalga_yubor(matn + chr(10) + qoshimcha if qoshimcha else matn)
 
 
 def holat_otishini_kuzat(conn, device, status, motosoat, hozir):
@@ -1240,7 +1329,7 @@ def hisobotni_kanalga_yubor(conn, kalit):
         png = smena_hisoboti(conn, kalit[6:])[0]
     else:
         png = kunlik_hisobot(conn, kalit)[0]
-    if not telegram_rasm(png, "", TELEGRAM_CHANNEL_ID):
+    if not telegram_rasm(png, "⏳ kechikib keldi (tekshiruvdan keyin)", TELEGRAM_CHANNEL_ID):
         return False
     with db_lock:
         conn.execute("INSERT OR REPLACE INTO hisobot_yuborilgan VALUES (?, ?)", (kalit, int(time.time())))
