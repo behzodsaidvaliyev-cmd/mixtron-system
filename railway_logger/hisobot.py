@@ -369,7 +369,9 @@ def rasm_chizish(statlar, sana_matn, sarlavha="kunlik hisobot", boshlanish_daq=0
         d.rounded_rectangle((lx, ly + 4, lx + 22, ly + 22), radius=4, fill=rang)
         d.text((lx + 32, ly), nom, font=f_belgi, fill=XIRA)
         lx += 50 + d.textlength(nom, font=f_belgi)
-    if aloqasiz_bor:
+    # shtrix kun oxiridagi uzilishdan tashqari, motosoat tasdiqlamagan
+    # oraliqda ham chiziladi (_voqea_ishini_tekshir) - izohi ikkalasida ham kerak
+    if aloqasiz_bor or any(ALOQA_YOQ in s["holat"] for s in statlar):
         _shtrix(d, lx, ly + 4, lx + 22, ly + 22)
         d.text((lx + 32, ly), "aloqa yo'q", font=f_belgi, fill=XIRA)
         lx += 50 + d.textlength("aloqa yo'q", font=f_belgi)
