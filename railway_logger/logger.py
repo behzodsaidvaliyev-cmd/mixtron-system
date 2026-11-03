@@ -1123,7 +1123,13 @@ def holat_xabari(conn, device, event_type, event_ts, hozir):
         soat = time.strftime("%d.%m %H:%M", vaqt)
     qatorlar = ["{} {} — {}".format(belgi, zavod_nomi(device), soz), "🕐 " + soat]
     try:
-        qatorlar.append("Bugun ishlagan: " + hisobot.soat_daqiqa(compute_hours_today(conn, device)))
+        # Voqea paytidagi holat: kechikib kelgan xabarda yuborish paytidagi
+        # soat ko'rsatilardi (2026-11-03 zavod3: 09:49 O'CHDI, 10:41 da
+        # kelgan - 8:36 o'rniga 9:06 yozilgan).
+        kun = time.strftime("%Y-%m-%d", vaqt)
+        ishlagan = compute_hours_range(conn, device, local_midnight_utc_ts(kun), event_ts)
+        qatorlar.append(("Bugun ishlagan: " if vaqt[:3] == bugun[:3] else "O'sha kuni ishlagan: ")
+                        + hisobot.soat_daqiqa(ishlagan))
     except Exception as e:
         print("[KANAL] bugungi soat hisoblanmadi:", e)
     if hozir - event_ts > KECHIKKAN_VOQEA_S:
@@ -1370,6 +1376,17 @@ def nazorat_json(conn, soat=12):
                 sakrash.append({"vaqt": mahalliy(t2), "oraliq_daq": round(dt * 60, 1), "motosoat_osdi_soat": round(dm, 3)})
             if t2 - t1 > 300:
                 boshliq.append({"dan": mahalliy(t1), "gacha": mahalliy(t2), "daq": int((t2 - t1) // 60)})
+        # oyna boshi va oxiridagi uzilish ham bo'shliq (2026-11-03 zavod3:
+        # 09:06-10:40 oyna boshida bo'lgani uchun ro'yxatga tushmagan)
+        if not rows:
+            boshliq.append({"dan": mahalliy(dan), "gacha": mahalliy(hozir), "daq": (hozir - dan) // 60})
+        else:
+            if rows[0][0] - dan > 300:
+                boshliq.insert(0, {"dan": mahalliy(dan), "gacha": mahalliy(rows[0][0]),
+                                   "daq": int((rows[0][0] - dan) // 60)})
+            if hozir - rows[-1][0] > 300:
+                boshliq.append({"dan": mahalliy(rows[-1][0]), "gacha": mahalliy(hozir),
+                                "daq": int((hozir - rows[-1][0]) // 60)})
         on_w = sorted(r[2] for r in rows if r[1] == "ON" and r[2] is not None)
         off_w = [r[2] for r in rows if r[1] == "OFF" and r[2] is not None]
         voqealar = []
