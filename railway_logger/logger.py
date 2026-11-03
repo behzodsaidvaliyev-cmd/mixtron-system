@@ -983,6 +983,60 @@ _qoriq_lock = threading.Lock()
 _oxirgi_olchov = {}        # zavod -> (status, ts, motosoat)
 _kutilayotgan = []         # [zavod, tur, taxminiy_ts, muddat]
 _kanalga_chiqqan = []      # [(zavod, tur, ts)] - oxirgi kunlar
+_tiklanishlar = []         # [zavod, jimlik_boshi, tiklangan_ts, tekshirish_vaqti]
+
+# --- Aloqa tiklanganda kanaldagi holatni to'g'rilash ---
+# Aloqa uzilgan paytdagi ON/OFF lar 2 soatdan eski bo'lsa kanalga chiqmaydi
+# (KANAL_ESKI_CHEGARA_S) - kanalda zavod "o'chdi" bo'lib qolib, aslida
+# yoniq bo'lishi mumkin. Aloqa tiklangandan TIKLANISH_KUTISH_S keyin (datchik
+# navbatidagi voqealar va o'lchovdan xabar shu orada chiqib bo'ladi) hozirgi
+# holat kanalga oxirgi chiqqan holat bilan solishtiriladi; farq qilsa kanalga
+# "aloqa tiklandi, hozir: ..." xabari ketadi. Bir xil bo'lsa - xabar yo'q.
+TIKLANISH_KUTISH_S = 180
+
+
+def kanaldagi_oxirgi_holat(conn, device):
+    """Kanalga muvaffaqiyatli chiqqan oxirgi holat ('ON'/'OFF') yoki None.
+    Jurnaldan olinadi - qayta ishga tushishda ham yo'qolmaydi."""
+    nom = zavod_nomi(device)
+    with db_lock:
+        rows = conn.execute(
+            "SELECT matn FROM telegram_jurnal WHERE tur = 'kanal' AND natija = 'ok' "
+            "AND (matn LIKE ? OR matn LIKE ?) ORDER BY ts DESC, id DESC LIMIT 1",
+            ("%" + nom + " —%", "%" + nom + " bilan aloqa tiklandi%")).fetchall()
+    if not rows:
+        return None
+    matn = rows[0][0]
+    if "— YONDI" in matn or "Hozir: 🟢" in matn:
+        return "ON"
+    if "— O'CHDI" in matn or "Hozir: 🔴" in matn:
+        return "OFF"
+    return None
+
+
+def tiklanishni_tekshir(conn, device, jim_boshi, tiklangan, hozir):
+    with db_lock:
+        r = conn.execute("SELECT status FROM readings WHERE device = ? ORDER BY received_ts DESC LIMIT 1",
+                         (device,)).fetchone()
+    joriy = r[0] if r else None
+    oldingi = kanaldagi_oxirgi_holat(conn, device)
+    if joriy not in ("ON", "OFF") or oldingi is None or joriy == oldingi:
+        print("[KANAL] {} aloqa tiklandi: hozir {}, kanalda {} - xabar kerak emas".format(device, joriy, oldingi))
+        return
+
+    def vaqt(ts):
+        return time.strftime("%H:%M" if time.gmtime(ts + UZ_OFFSET)[:3] == time.gmtime(hozir + UZ_OFFSET)[:3]
+                             else "%d.%m %H:%M", time.gmtime(ts + UZ_OFFSET))
+
+    qatorlar = ["🔄 {} bilan aloqa tiklandi".format(zavod_nomi(device)),
+                "Aloqa yo'q edi: {} – {}".format(vaqt(jim_boshi), vaqt(tiklangan)),
+                "Hozir: " + ("🟢 YONIQ" if joriy == "ON" else "🔴 O'CHIQ")]
+    try:
+        qatorlar.append("Bugun ishlagan: " + hisobot.soat_daqiqa(compute_hours_today(conn, device)))
+    except Exception as e:
+        print("[KANAL] bugungi soat hisoblanmadi:", e)
+    print("[KANAL] {} aloqa tiklandi: kanalda {}, hozir {} - xabar yuborildi".format(device, oldingi, joriy))
+    kanalga_yubor(chr(10).join(qatorlar))
 
 
 def _xuddi_shu_otish(device, tur, ts, x, royxat):
@@ -1057,6 +1111,9 @@ def holat_otishini_kuzat(conn, device, status, motosoat, hozir):
                 "ORDER BY received_ts DESC LIMIT 1", (device, hozir)).fetchone()
         oldin = tuple(r) if r else None
     _oxirgi_olchov[device] = (status, hozir, motosoat)
+    if oldin and oldin[1] and hozir - oldin[1] > SILENCE_LIMIT_S:
+        with _qoriq_lock:
+            _tiklanishlar.append([device, oldin[1], hozir, hozir + TIKLANISH_KUTISH_S])
     if not oldin or oldin[0] == status or oldin[0] not in ("ON", "OFF"):
         return
     o_status, o_ts, o_mot = oldin
@@ -1094,6 +1151,11 @@ def voqea_qoriqchisi(conn):
                 print("[KANAL] {} {} voqeasi kelmadi - o'lchov bo'yicha yuborildi ({})".format(
                     device, tur, time.strftime("%H:%M:%S", time.gmtime(taxmin + UZ_OFFSET))))
                 kanalga_holat_yubor(conn, device, tur, taxmin, hozir)
+            with _qoriq_lock:
+                tiklangan = [k for k in _tiklanishlar if k[3] <= hozir]
+                _tiklanishlar[:] = [k for k in _tiklanishlar if k[3] > hozir]
+            for device, jim_boshi, tiklanish, _ in tiklangan:
+                tiklanishni_tekshir(conn, device, jim_boshi, tiklanish, hozir)
         except Exception as e:
             print("[KANAL] qoriqchida xato:", e)
 
