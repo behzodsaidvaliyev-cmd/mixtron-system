@@ -390,7 +390,7 @@ def on_message(client, userdata, msg):
                 " " + " ".join(parts[4:]) if len(parts) > 4 else ""))
             if event_type in ("ON", "OFF"):          # BOOT - qurilma yoqilgani, drobilka ishi emas
                 kanalga_holat_yubor(conn, device, event_type, event_ts, now,
-                                    "⚡ elektr o'chgan" if elektr is not None else "")
+                                    "⚡ elektr o'chgan edi" if elektr is not None else "")
             elif event_type == "BOOT":
                 boot_oldidagi_offni_tuzat(conn, device, event_ts)
         except Exception as e:
