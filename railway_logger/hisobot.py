@@ -162,7 +162,19 @@ def kun_statistikasi(conn, lock, device, kun_boshi, hours_fn):
             i = j
             continue
         if oldin is not None and keyin is not None:
-            qiymat = 1 if (keyin - oldin) * 60 >= 0.5 * (j - i) else 0
+            # Oraliq boshidagi bo'shliqda "oldin" - oraliqdan oldingi oxirgi
+            # o'lchov, u ancha avval bo'lishi mumkin va undan keyingi (oraliqqa
+            # kirmaydigan) ish ham o'sishga qo'shilib ketardi: 2026-11-06 zavod2
+            # smena - 06:25-07:05 ishi 08:00-08:48 ga tushib, chiziq raqamdan 48
+            # daqiqa ortiq chiqqan. Shu holatda o'sish hours_fn dan olinadi (u
+            # oraliq boshidagi motosoatni voqealar bilan interpolyatsiya qiladi).
+            # Ichki bo'shliqlarda qo'shni o'lchovlar aniqroq: hours_fn 1-2
+            # daqiqalik bo'shliqni ikkala chetini bitta o'lchovga bog'lab 0 beradi.
+            if i == 0:
+                osish = hours_fn(device, kun_boshi, kun_boshi + j * 60)
+            else:
+                osish = keyin - oldin
+            qiymat = 1 if osish * 60 >= 0.5 * (j - i) else 0
         elif i > 0:
             qiymat = holat[i - 1]
         else:
