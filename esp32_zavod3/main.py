@@ -69,6 +69,17 @@ WIFI_CONNECT_TIMEOUT_S = 15
 WIFI_RETRY_INTERVAL_S = 20      # ulanmasa, shuncha soniyada qayta urinadi
 WIFI_HEALTH_INTERVAL_S = 30     # ish paytida WiFi uzilmaganini tekshirish oralig'i
 WIFI_RETRY_BACKOFF_S = (30, 60, 300)   # ketma-ket ulanmasa, urinishlar orasi uzayadi
+# --- Tarmoq "qotib" qolganda o'zini tiklash ---
+# 2026-11-07 zavod1: 21:54 da tarmoq uzildi va 2.5 kun qaytmadi. Qurilma bu
+# vaqt davomida o'lchab, voqealarni yozib turdi (WDT oziqlangani uchun qayta
+# yuklanmadi), lekin brokerga birorta ham urinish yetib bormadi. Wi-Fi moduli
+# sog' edi va o'sha router'ga yangi qurilma darhol ulandi - elektrdan uzib
+# yoqish tuzatardi. Endi buni qurilmaning o'zi qiladi:
+WIFI_RADIO_RESET_AFTER_FAILS = 3        # shuncha ketma-ket urinishdan keyin Wi-Fi moduli o'chirib-yoqiladi
+OFFLINE_REBOOT_S = 1800                 # broker bilan aloqa shuncha bo'lmasa - qayta yuklanadi
+OFFLINE_REBOOT_MAX_S = 6 * 3600         # internet uzoq yo'q bo'lsa oraliq 2x o'sib, shundan oshmaydi
+OFFLINE_REBOOTS_FILE = "offline_reboots.txt"   # ketma-ket "aloqasizlik" qayta yuklanishlari soni
+MOTOSOAT_SET_MAX_S = 500 * 3600         # SET_MOTOSOAT faqat oshiradi, bundan ko'pga emas
 NTP_RETRY_INTERVAL_S = 60       # vaqt sozlanmagan bo'lsa, qayta urinish oralig'i
 MAX_SANE_DT_S = 300             # bundan katta vaqt farqi = soat sakragan, hisobga olinmaydi
 # NTP protokoli 2036-02-07 da "aylanadi" va ba'zi javoblar 136 yil noto'g'ri
@@ -504,6 +515,14 @@ def wifi_begin():
         _wifi_pending = False
         return True
     ssid, password = load_wifi_config()
+    if _wifi_fails and _wifi_fails % WIFI_RADIO_RESET_AFTER_FAILS == 0:
+        print("[WIFI] {} marta ulanmadi - Wi-Fi moduli o'chirib-yoqilmoqda".format(_wifi_fails))
+        try:
+            wlan.active(False)
+            time.sleep(0.5)
+            wlan.active(True)
+        except Exception as e:
+            print("[WIFI] modulni qayta yoqib bo'lmadi:", e)
     print("[WIFI] ulanmoqda:", ssid)
     try:
         wlan.disconnect()
@@ -898,6 +917,21 @@ def confirm_ota_stable():
 # MQTT (SSL) - HiveMQ Cloud
 # ---------------------------------------------------------------------------
 
+# Motosoatni masofadan to'g'rilash (qurilma almashtirilganda hisoblagich
+# eskisidan davom etishi uchun). Callback motosec ga yeta olmaydi - qiymat shu
+# yerda kutadi va main() keyingi aylanishda qo'llaydi.
+_motosoat_buyruq = None
+
+
+def _motosoat_buyrugi(matn):
+    global _motosoat_buyruq
+    try:
+        _motosoat_buyruq = _hours_text_to_sec(matn.strip())
+        print("[MOTOSOAT] buyruq qabul qilindi:", matn.strip())
+    except Exception as e:
+        print("[MOTOSOAT] noto'g'ri qiymat:", matn, e)
+
+
 def mqtt_message_callback(topic, msg):
     global amp_threshold
     try:
@@ -926,6 +960,8 @@ def mqtt_message_callback(topic, msg):
             print("[THRESHOLD] yangi chegara:", value)
         except Exception as e:
             print("[THRESHOLD] xato:", e)
+    elif cmd.startswith("SET_MOTOSOAT|"):
+        _motosoat_buyrugi(cmd.split("|", 1)[1])
 
 
 # ---------------------------------------------------------------------------
@@ -1495,6 +1531,9 @@ def check_serial_commands():
             DEVICE, amp_threshold, gc.mem_free(), wifi_is_up(),
             "OK" if CONFIG_OK else "XATO", "OK" if time_is_valid() else "SOZLANMAGAN"))
 
+    elif line.startswith("SET_MOTOSOAT|"):
+        _motosoat_buyrugi(line.split("|", 1)[1])
+
     elif line == "REBOOT":
         print("REBOOTING")
         time.sleep(1)
@@ -1530,7 +1569,7 @@ def boot_safe_window():
 # ---------------------------------------------------------------------------
 
 def main():
-    global wdt, pzem_fail_count
+    global wdt, pzem_fail_count, _motosoat_buyruq
 
     if not boot_safe_window():
         return  # xavfsiz rejim: WDT yoqilmaydi, REPL bilan ishlash mumkin
@@ -1588,10 +1627,43 @@ def main():
     except Exception as e:
         print("[MQTT] boshlang'ich ulanish xatosi:", e)
 
+    offline_reboots = int(_read_float(OFFLINE_REBOOTS_FILE, 0))
+    offline_limit = min(OFFLINE_REBOOT_S * (2 ** min(offline_reboots, 8)), OFFLINE_REBOOT_MAX_S)
+    last_online = uptime_s()
+
     while True:
         feed_wdt()
         check_serial_commands()
         now = time.time()
+
+        # --- Broker bilan aloqa uzoq yo'q -> o'zini qayta yuklash ---
+        if client is not None:
+            last_online = uptime_s()
+            if offline_reboots:
+                offline_reboots = 0
+                _safe_remove(OFFLINE_REBOOTS_FILE)
+        elif uptime_s() - last_online >= offline_limit:
+            print("[NET] {} daqiqa broker bilan aloqa yo'q - qayta yuklanmoqda".format(offline_limit // 60))
+            if motosec != saved_motosec:
+                save_motosec(motosec)
+            try:
+                _atomic_write(OFFLINE_REBOOTS_FILE, str(offline_reboots + 1))
+            except Exception:
+                pass
+            time.sleep(1)
+            machine.reset()
+
+        # --- Motosoatni masofadan to'g'rilash (SET_MOTOSOAT) ---
+        if _motosoat_buyruq is not None:
+            yangi = _motosoat_buyruq
+            _motosoat_buyruq = None
+            if motosec <= yangi <= motosec + MOTOSOAT_SET_MAX_S:
+                print("[MOTOSOAT] {} -> {}".format(hours_text(motosec), hours_text(yangi)))
+                motosec = yangi
+                if save_motosec(motosec):
+                    saved_motosec = motosec
+            else:
+                print("[MOTOSOAT] rad etildi: {} (joriy {})".format(hours_text(yangi), hours_text(motosec)))
 
         # WiFi ulanishi FONDA kuzatiladi - bu yerda hech narsa kutilmaydi.
         if wifi_poll():                # endigina ulandi

@@ -226,9 +226,10 @@ def run_all():
 
     asl_advance = W.advance
     def _tarmoq_qaytadi(sec):
-        # Yarim soat oflayn turgach, SHU yoqilishning ichida internet keladi
+        # 25 daqiqa oflayn turgach, SHU yoqilishning ichida internet keladi
+        # (30 daqiqada qurilma o'zini qayta yuklaydi - OFFLINE_REBOOT_S)
         asl_advance(sec)
-        if W.mono >= 1800 and not W.wifi_can_connect:
+        if W.mono >= 1500 and not W.wifi_can_connect:
             W.wifi_can_connect = True
             W.ntp_works = True
     W.advance = _tarmoq_qaytadi
@@ -523,6 +524,72 @@ def run_all():
     d19 = data_lines()
     check("ma'lumot uzluksiz ketdi (HiveMQ orqali)", len(d19) > 300, "{} ta".format(len(d19)))
     check("WDT/qayta yuklanish yo'q", out == "tugadi", out)
+
+    # =====================================================================
+    print("\n=== 22. Tarmoq QOTIB QOLDI - Wi-Fi o'chirib-yoqiladi, 30 daqiqada qayta yuklanadi ===")
+    # 2026-11-07 zavod1: Wi-Fi 2.5 kun ulanmadi, qurilma o'lchashda davom etib
+    # WDT ni oziqlantirdi va hech qachon qayta yuklanmadi.
+    W.__init__()
+    new_device(tmp)
+    W.wifi_up = False
+    W.wifi_can_connect = False
+    W.pzem_current = 9.0
+    yozuv = []
+    import builtins
+    asl_print = builtins.print
+    builtins.print = lambda *a, **k: yozuv.append(" ".join(str(x) for x in a))
+    try:
+        out = boot(4000)
+    finally:
+        builtins.print = asl_print
+    check("30 daqiqada o'zini qayta yukladi", out == "reset", out)
+    check("Wi-Fi moduli o'chirib-yoqildi", any("o'chirib-yoqilmoqda" in x for x in yozuv))
+    check("qayta yuklanish hisoblagichi saqlandi", open("offline_reboots.txt").read().strip() == "1")
+    mot = open("motohours.txt").read().strip()
+    check("motosoat qayta yuklanishdan oldin saqlandi", float(mot) >= 0.49, mot)
+
+    print("\n=== 23. Ikkinchi aloqasizlikda oraliq 2 baravar (60 daqiqa) ===")
+    W.wifi_up = False
+    W.wifi_can_connect = False
+    out2 = boot(3300)
+    check("60 daqiqa o'tmaguncha qayta yuklanmadi", out2 == "tugadi", out2)
+    out3 = boot(3700)
+    check("60 daqiqadan keyin qayta yuklandi", out3 == "reset", out3)
+    check("hisoblagich 2 ga oshdi", open("offline_reboots.txt").read().strip() == "2")
+
+    print("\n=== 24. Aloqa tiklangach hisoblagich tozalanadi ===")
+    W.wifi_up = True
+    W.wifi_can_connect = True
+    out4 = boot(120)
+    check("normal ishladi", out4 == "tugadi", out4)
+    check("offline_reboots.txt o'chirildi", not os.path.exists("offline_reboots.txt"))
+
+    print("\n=== 25. SET_MOTOSOAT: faqat oshiradi, chegaradan oshmaydi ===")
+    W.__init__()
+    new_device(tmp)
+    for f in ("motohours.txt", "motohours.bak"):
+        with open(f, "w") as fh:
+            fh.write("1480.815500")
+    W.pzem_current = 0.0
+    for buyruq, kutilgan in (("SET_MOTOSOAT|1536.3561", "1536.3561"),
+                             ("SET_MOTOSOAT|1000.0", "1536.3561"),      # kamaytirish rad etiladi
+                             ("SET_MOTOSOAT|99999", "1536.3561")):      # 500 soatdan ko'p rad etiladi
+        sys.modules.pop("main", None)
+        W.mono = 0.0
+        W.wdt_last_feed = 0.0
+        W.budget = 30
+        m = importlib.import_module("main")
+        m.WSMQTTClient = m.MQTTClient
+        topic = m.MQTT_COMMAND_TOPIC
+        m.mqtt_message_callback(topic.encode() if isinstance(topic, str) else topic, buyruq.encode())
+        try:
+            m.main()
+        except SimEnd:
+            pass
+        finally:
+            W.budget = None
+        got = open("motohours.txt").read().strip()
+        check(buyruq + " -> " + kutilgan, got.startswith(kutilgan), got)
 
     print("\n" + "=" * 62)
     passed = sum(1 for _, ok, _ in RESULTS if ok)
