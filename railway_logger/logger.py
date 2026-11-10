@@ -50,6 +50,26 @@ BIR_MARTALIK_TUZATISH = [
     ("zavod3", "2026-09-07 02:40:05", "ON",   197.8964, "2026-09-06 21:31:50"),
 ]
 
+# --- zavod1 ESP32 almashtirildi (2026-11-10) ---
+# Eski qurilma 2026-11-07 21:54 da tarmoqdan qolib ketdi, lekin 10.11 12:27
+# gacha o'lchab, 16 ta voqeani xotirasida saqladi (USB orqali o'qildi).
+# Yangi qurilma 12:29:26 da 1480.8155 dan boshladi; 15:27:57 da
+# SET_MOTOSOAT bilan eski hisoblagichdan davom ettirildi. Oradagi yangi
+# qurilma qiymatlari ALMASHISH_FARQI ga suriladi - aks holda motosoat 15:27
+# da 55 soat "sakrab", o'sha kunga 55 soat ish qo'shilardi.
+# oxirgi qiymat - shundan kichigi hali surilmagan: yangi qurilma 1480-1484, surilgani 1536+
+ALMASHISH = ("zavod1", "2026-11-10 12:29:26", "2026-11-10 15:27:57", 55.540611, 1500.0)
+ESKI_QURILMA_VOQEALARI = [   # (zavod, event_ts UTC, tur, motosoat)
+    ("zavod1", 1794103324, "OFF", 1489.9444), ("zavod1", 1794109375, "ON", 1489.9486),
+    ("zavod1", 1794109392, "OFF", 1489.9486), ("zavod1", 1794110882, "ON", 1489.9527),
+    ("zavod1", 1794188018, "OFF", 1511.3752), ("zavod1", 1794188574, "ON", 1511.3791),
+    ("zavod1", 1794188634, "OFF", 1511.3916), ("zavod1", 1794190198, "ON", 1511.3955),
+    ("zavod1", 1794190316, "OFF", 1511.4241), ("zavod1", 1794190404, "ON", 1511.4283),
+    ("zavod1", 1794197364, "OFF", 1513.3575), ("zavod1", 1794198782, "ON", 1513.3613),
+    ("zavod1", 1794234580, "OFF", 1523.3013), ("zavod1", 1794234596, "ON", 1523.3055),
+    ("zavod1", 1794279635, "OFF", 1535.8125), ("zavod1", 1794293723, "ON", 1535.8166),
+]
+
 SILENCE_LIMIT_S = int(os.environ.get("SILENCE_LIMIT_S", "600"))   # 10 daqiqa
 SILENCE_CHECK_S = int(os.environ.get("SILENCE_CHECK_S", "60"))    # tekshirish oralig'i
 SILENCE_FORGET_S = 7 * 86400        # shuncha vaqt ko'rinmagan qurilma kuzatilmaydi
@@ -229,6 +249,30 @@ def get_conn():
     if tuzatildi:
         conn.commit()
         print("[DB] jami {} ta voqea sanasi aniqlashtirildi".format(tuzatildi))
+
+    # Qurilma almashtirilgan oraliqni moslash (yuqoridagi ALMASHISH). Faqat
+    # hali surilmagan (eski hisoblagichdan kichik) qiymatlar o'zgaradi -
+    # qayta ishga tushishda hech narsa o'zgarmaydi.
+    z, dan, gacha, farq, surilmagan = ALMASHISH
+    dan_ts, gacha_ts = local_str_to_utc_ts(dan), local_str_to_utc_ts(gacha)
+    n_r = conn.execute("UPDATE readings SET motosoat = motosoat + ? WHERE device = ? "
+                       "AND received_ts >= ? AND received_ts < ? AND motosoat < ?",
+                       (farq, z, dan_ts, gacha_ts, surilmagan)).rowcount
+    n_v = conn.execute("UPDATE cycle_events SET motosoat = motosoat + ? WHERE device = ? "
+                       "AND event_ts >= ? AND event_ts < ? AND motosoat < ?",
+                       (farq, z, dan_ts, gacha_ts, surilmagan)).rowcount
+    n_q = 0
+    for device, ts, tur, ms in ESKI_QURILMA_VOQEALARI:
+        if not conn.execute("SELECT 1 FROM cycle_events WHERE device = ? AND event_ts = ? AND event_type = ?",
+                            (device, ts, tur)).fetchone():
+            conn.execute("INSERT INTO cycle_events (device, event_ts, event_time_local, event_type, motosoat) "
+                         "VALUES (?, ?, ?, ?, ?)",
+                         (device, ts, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts + UZ_OFFSET)), tur, ms))
+            n_q += 1
+    conn.commit()
+    if n_r or n_v or n_q:
+        print("[DB] {} almashtirish: {} o'lchov va {} voqea motosoati +{} soat, eski qurilmadan {} voqea".format(
+            z, n_r, n_v, farq, n_q))
 
     # Elektr uzilishidagi OFF voqealari (BOOT yonida yozilgan) - vaqti motosoatdan.
     # Tuzatilgandan keyin OFF BOOT yonida qolmaydi, demak qayta ishga
